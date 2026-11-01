@@ -59,9 +59,18 @@ public class Scaffold extends Module {
     private Vec3 pendingHitVec = null;
     private boolean placedThisTick = false;
     private long lastPlaceTime = 0L;
-    private BlockPos aimCachePos = null;
-    private EnumFacing aimCacheFacing = null;
-    private double[] aimCachePoint = null;
+    private BlockPos randomPointPos = null;
+    private EnumFacing randomPointFacing = null;
+    private double[] randomPoint = null;
+    private BlockPos aimResultPos = null;
+    private EnumFacing aimResultFacing = null;
+    private AimResult aimResult = null;
+    private BlockData stableBlockData = null;
+    private int stableBlockDataAge = 0;
+    private float lastAimYaw = 0.0F;
+    private float lastAimPitch = 0.0F;
+    private int lastAimTick = 0;
+    private int tickCounter = 0;
     public final ModeProperty rotationMode = new ModeProperty("rotations", 2, new String[]{"NONE", "DEFAULT", "BACKWARDS", "SIDEWAYS"});
     public final ModeProperty aimMode = new ModeProperty(
             "rotation-mode",
@@ -78,7 +87,8 @@ public class Scaffold extends Module {
     public final ModeProperty keepY = new ModeProperty("keep-y", 0, new String[]{"NONE", "VANILLA", "EXTRA", "TELLY"});
     public final BooleanProperty keepYonPress = new BooleanProperty("keep-y-on-press", false, () -> this.keepY.getValue() != 0);
     public final BooleanProperty disableWhileJumpActive = new BooleanProperty("no-keep-y-on-jump-potion", false, () -> this.keepY.getValue() != 0);
-    public final IntProperty placeDelay = new IntProperty("place-delay", 90, 0, 500);
+    public final IntProperty placeDelay = new IntProperty("place-delay", 50, 0, 500);
+    public final IntProperty placeAhead = new IntProperty("place-ahead", 2, 0, 4);
     public final BooleanProperty trueSight = new BooleanProperty("true-sight", true);
     public final IntProperty rotationSpeed = new IntProperty("rotation-speed", 180, 1, 180, this::hasRotation);
     public final IntProperty pitchSpeed = new IntProperty("pitch-speed", 90, 1, 90, this::hasRotation);
@@ -131,13 +141,56 @@ public class Scaffold extends Module {
         return enumFacing;
     }
 
-    private BlockData getBlockData() {
+    private BlockPos getTargetPos() {
+        double ahead = (double) this.placeAhead.getValue();
+        double predictedX = mc.thePlayer.posX + mc.thePlayer.motionX * ahead;
+        double predictedZ = mc.thePlayer.posZ + mc.thePlayer.motionZ * ahead;
         int startY = MathHelper.floor_double(mc.thePlayer.posY);
-        BlockPos targetPos = new BlockPos(
-                MathHelper.floor_double(mc.thePlayer.posX),
+        return new BlockPos(
+                MathHelper.floor_double(predictedX),
                 (this.stage != 0 && !this.shouldKeepY ? Math.min(startY, this.startY) : startY) - 1,
-                MathHelper.floor_double(mc.thePlayer.posZ)
+                MathHelper.floor_double(predictedZ)
         );
+    }
+
+    private BlockData getBlockData() {
+        BlockPos targetPos = this.getTargetPos();
+        if (this.stableBlockData != null
+                && this.stableBlockDataAge < 5
+                && this.isBlockDataValid(this.stableBlockData, targetPos)) {
+            this.stableBlockDataAge++;
+            return this.stableBlockData;
+        }
+        BlockData blockData = this.findBlockData(targetPos);
+        this.stableBlockData = blockData;
+        this.stableBlockDataAge = 0;
+        return blockData;
+    }
+
+    private boolean isBlockDataValid(BlockData blockData, BlockPos targetPos) {
+        BlockPos support = blockData.blockPos();
+        if (BlockUtil.isReplaceable(support) || BlockUtil.isInteractable(support)) {
+            return false;
+        }
+        BlockPos placed = support.offset(blockData.facing());
+        if (!BlockUtil.isReplaceable(placed)) {
+            return false;
+        }
+        double reach = (double) mc.playerController.getBlockReachDistance() + 0.5;
+        if (mc.thePlayer.getDistance(
+                (double) support.getX() + 0.5, (double) support.getY() + 0.5, (double) support.getZ() + 0.5
+        ) > reach) {
+            return false;
+        }
+        if (placed.distanceSqToCenter(
+                (double) targetPos.getX() + 0.5, (double) targetPos.getY() + 0.5, (double) targetPos.getZ() + 0.5
+        ) > 9.0) {
+            return false;
+        }
+        return this.stage == 0 || this.shouldKeepY || support.getY() < this.startY;
+    }
+
+    private BlockData findBlockData(BlockPos targetPos) {
         if (!BlockUtil.isReplaceable(targetPos)) {
             return null;
         } else {
@@ -275,6 +328,7 @@ public class Scaffold extends Module {
     public void onUpdate(UpdateEvent event) {
         if (this.isEnabled() && event.getType() == EventType.PRE) {
             this.placedThisTick = false;
+            this.tickCounter++;
             if (this.rotationTick > 0) {
                 this.rotationTick--;
             }
@@ -365,6 +419,12 @@ public class Scaffold extends Module {
                     if (aim != null) {
                         targetYaw = aim.yaw;
                         targetPitch = aim.pitch;
+                        this.lastAimYaw = aim.yaw;
+                        this.lastAimPitch = aim.pitch;
+                        this.lastAimTick = this.tickCounter;
+                    } else if (this.lastAimTick > 0 && this.tickCounter - this.lastAimTick <= 6) {
+                        targetYaw = this.lastAimYaw;
+                        targetPitch = this.lastAimPitch;
                     } else if (this.isTowering() || this.towering) {
                         float yawDelta = MathHelper.wrapAngleTo180_float(mc.thePlayer.rotationYaw - event.getYaw());
                         targetYaw = event.getYaw() + yawDelta * RandomUtil.nextFloat(0.98F, 0.99F);
@@ -454,12 +514,12 @@ public class Scaffold extends Module {
         if (absDelta < 1.0E-4F) {
             return 0.0F;
         }
-        if (absDelta <= maxSpeed) {
-            return delta;
-        }
         float smooth = (float) this.smoothness.getValue() / 100.0F;
-        float ratio = (1.0F - 0.5F * smooth) * RandomUtil.nextFloat(0.9F, 1.0F);
-        float step = Math.min(absDelta, maxSpeed * Math.max(0.3F, ratio));
+        if (smooth <= 0.0F || absDelta <= 6.0F) {
+            return Math.copySign(Math.min(absDelta, maxSpeed), delta);
+        }
+        float step = Math.min(absDelta, maxSpeed) * (1.0F - 0.6F * smooth);
+        step = Math.max(step, Math.min(absDelta, 6.0F));
         return Math.copySign(step, delta);
     }
 
@@ -481,13 +541,22 @@ public class Scaffold extends Module {
         float yawLimit = applyLimits ? (float) this.yawLimit.getValue() : 180.0F;
         float pitchLimit = applyLimits ? (float) this.pitchLimit.getValue() : 90.0F;
         int mode = this.aimMode.getValue();
+        if (this.aimResult != null && pos.equals(this.aimResultPos) && facing == this.aimResultFacing) {
+            AimResult cached = this.checkAimPoint(
+                    pos, facing, this.aimResult.point, desiredYaw, desiredPitch, yawLimit, pitchLimit, reach, eyeX, eyeY, eyeZ
+            );
+            if (cached != null) {
+                this.aimResult = cached;
+                return cached;
+            }
+        }
         if (mode <= 2) {
             AimResult preferred = this.checkAimPoint(
                     pos, facing, this.preferredAimPoint(pos, facing, mode),
                     desiredYaw, desiredPitch, yawLimit, pitchLimit, reach, eyeX, eyeY, eyeZ
             );
             if (preferred != null) {
-                return preferred;
+                return this.rememberAim(pos, facing, preferred);
             }
         }
         float moveYaw = this.getCurrentYaw();
@@ -511,7 +580,14 @@ public class Scaffold extends Module {
                 best = result;
             }
         }
-        return best;
+        return best == null ? null : this.rememberAim(pos, facing, best);
+    }
+
+    private AimResult rememberAim(BlockPos pos, EnumFacing facing, AimResult aim) {
+        this.aimResultPos = pos;
+        this.aimResultFacing = facing;
+        this.aimResult = aim;
+        return aim;
     }
 
     private AimResult checkAimPoint(
@@ -536,7 +612,7 @@ public class Scaffold extends Module {
                 && mop.typeOfHit == MovingObjectType.BLOCK
                 && mop.getBlockPos().equals(pos)
                 && mop.sideHit == facing) {
-            return new AimResult(rotations[0], rotations[1], mop.hitVec);
+            return new AimResult(rotations[0], rotations[1], mop.hitVec, point);
         }
         return null;
     }
@@ -564,17 +640,17 @@ public class Scaffold extends Module {
     private double[] preferredAimPoint(BlockPos pos, EnumFacing facing, int mode) {
         double fixed = Scaffold.faceFixed(facing);
         if (mode == 1) {
-            if (this.aimCachePoint == null || !pos.equals(this.aimCachePos) || facing != this.aimCacheFacing) {
-                this.aimCachePos = pos;
-                this.aimCacheFacing = facing;
-                this.aimCachePoint = Scaffold.facePoint(
+            if (this.randomPoint == null || !pos.equals(this.randomPointPos) || facing != this.randomPointFacing) {
+                this.randomPointPos = pos;
+                this.randomPointFacing = facing;
+                this.randomPoint = Scaffold.facePoint(
                         facing,
                         RandomUtil.nextDouble(0.2, 0.8),
                         RandomUtil.nextDouble(0.2, 0.8),
                         fixed
                 );
             }
-            return this.aimCachePoint;
+            return this.randomPoint;
         }
         if (mode == 2) {
             long hash = (long) pos.getX() * 73856093L
@@ -912,9 +988,16 @@ public class Scaffold extends Module {
         this.pendingHitVec = null;
         this.placedThisTick = false;
         this.lastPlaceTime = 0L;
-        this.aimCachePos = null;
-        this.aimCacheFacing = null;
-        this.aimCachePoint = null;
+        this.randomPointPos = null;
+        this.randomPointFacing = null;
+        this.randomPoint = null;
+        this.aimResultPos = null;
+        this.aimResultFacing = null;
+        this.aimResult = null;
+        this.stableBlockData = null;
+        this.stableBlockDataAge = 0;
+        this.lastAimTick = 0;
+        this.tickCounter = 0;
     }
 
     @Override
@@ -931,11 +1014,13 @@ public class Scaffold extends Module {
         private final float yaw;
         private final float pitch;
         private final Vec3 hitVec;
+        private final double[] point;
 
-        public AimResult(float yaw, float pitch, Vec3 hitVec) {
+        public AimResult(float yaw, float pitch, Vec3 hitVec, double[] point) {
             this.yaw = yaw;
             this.pitch = pitch;
             this.hitVec = hitVec;
+            this.point = point;
         }
     }
 
