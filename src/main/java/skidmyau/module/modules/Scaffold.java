@@ -111,7 +111,7 @@ public class Scaffold extends Module {
     public final IntProperty clickCpsMin = new IntProperty("click-cps-min", 10, 1, 20, () -> this.clickMode.getValue() != 0);
     public final IntProperty clickCpsMax = new IntProperty("click-cps-max", 14, 1, 20, () -> this.clickMode.getValue() != 0);
     public final BooleanProperty debug = new BooleanProperty("debug", false);
-    public final IntProperty placeAhead = new IntProperty("place-ahead", 2, 0, 4);
+    public final IntProperty placeAhead = new IntProperty("place-ahead", 3, 0, 5);
     public final BooleanProperty trueSight = new BooleanProperty("true-sight", true);
     public final IntProperty rotationSpeed = new IntProperty("rotation-speed", 180, 1, 180, this::hasRotation);
     public final IntProperty pitchSpeed = new IntProperty("pitch-speed", 90, 1, 90, this::hasRotation);
@@ -180,42 +180,75 @@ public class Scaffold extends Module {
     }
 
     /**
-     * Предсказывает грань, в которую нужно ставить блок.
-     * Приоритет: грань, которую реально видно из предсказанных глаз,
-     * затем - грань, в которую игрок уже смотрит (чтобы голова не дёргалась
-     * между несколькими равными кандидатами).
+     * Оценивает все грани опоры и возвращает лучшую вместе с её скором.
+     * Приоритет: грань перед камерой игрока (а не перед "клиентским" взглядом модуля),
+     * которую реально видно из предсказанных глаз, и в которую игрок уже смотрит.
+     * Грань, которая находится ЗА камерой игрока, не рассматривается вообще:
+     * именно из-за этого раньше предсказанная грань оказывалась сзади.
      */
-    private EnumFacing getBestFacing(BlockPos blockPos1, BlockPos blockPos3) {
+    private FaceChoice pickBestFace(BlockPos support, BlockPos targetPos) {
         Vec3 eye = this.getPredictedEyes();
-        Vec3 look = RotationUtil.getLookVec(mc.thePlayer.rotationYaw, mc.thePlayer.rotationPitch);
+        Vec3 look = RotationUtil.getLookVec(this.getPlayerYaw(), this.getPlayerPitch());
         double reach = (double) mc.playerController.getBlockReachDistance();
-        double offset = -Double.MAX_VALUE;
-        EnumFacing enumFacing = null;
+        FaceChoice best = null;
         for (EnumFacing facing : EnumFacing.VALUES) {
-            if (facing != EnumFacing.DOWN) {
-                BlockPos pos = blockPos1.offset(facing);
-                if (pos.getY() <= blockPos3.getY() && this.isPlacementAllowed(pos)) {
-                    double distance = pos.distanceSqToCenter((double) blockPos3.getX() + 0.5, (double) blockPos3.getY() + 0.5, (double) blockPos3.getZ() + 0.5);
-                    Vec3 center = new Vec3(
-                            (double) blockPos1.getX() + 0.5 + (double) facing.getFrontOffsetX() * 0.5,
-                            (double) blockPos1.getY() + 0.5 + (double) facing.getFrontOffsetY() * 0.5,
-                            (double) blockPos1.getZ() + 0.5 + (double) facing.getFrontOffsetZ() * 0.5
-                    );
-                    Vec3 dir = center.subtract(eye);
-                    double length = dir.lengthVector();
-                    double dot = length < 1.0E-6 ? 0.0 : (dir.xCoord * look.xCoord + dir.yCoord * look.yCoord + dir.zCoord * look.zCoord) / length;
-                    double score = dot * 4.0 - distance;
-                    if (this.isFaceVisible(eye, blockPos1, facing, dir, reach)) {
-                        score += 10.0;
-                    }
-                    if (enumFacing == null || score > offset || score == offset && facing == EnumFacing.UP) {
-                        offset = score;
-                        enumFacing = facing;
-                    }
-                }
+            if (facing == EnumFacing.DOWN) {
+                continue;
+            }
+            BlockPos placed = support.offset(facing);
+            if (placed.getY() > targetPos.getY() || !this.isPlacementAllowed(placed)) {
+                continue;
+            }
+            Vec3 center = new Vec3(
+                    (double) support.getX() + 0.5 + (double) facing.getFrontOffsetX() * 0.5,
+                    (double) support.getY() + 0.5 + (double) facing.getFrontOffsetY() * 0.5,
+                    (double) support.getZ() + 0.5 + (double) facing.getFrontOffsetZ() * 0.5
+            );
+            Vec3 dir = center.subtract(eye);
+            double length = dir.lengthVector();
+            double dot = length < 1.0E-6 ? 0.0 : (dir.xCoord * look.xCoord + dir.yCoord * look.yCoord + dir.zCoord * look.zCoord) / length;
+            if (dot <= 0.0) {
+                // Грань за камерой игрока - не кандидат.
+                continue;
+            }
+            double distance = placed.distanceSqToCenter(
+                    (double) targetPos.getX() + 0.5, (double) targetPos.getY() + 0.5, (double) targetPos.getZ() + 0.5
+            );
+            double score = dot * 4.0 - distance;
+            if (this.isFaceVisible(eye, support, facing, dir, reach)) {
+                score += 10.0;
+            }
+            if (best == null || score > best.score) {
+                best = new FaceChoice(facing, score);
             }
         }
-        return enumFacing;
+        return best;
+    }
+
+    private static final class FaceChoice {
+        private final EnumFacing facing;
+        private final double score;
+
+        private FaceChoice(EnumFacing facing, double score) {
+            this.facing = facing;
+            this.score = score;
+        }
+    }
+
+    /**
+     * Реальный взгляд игрока (камера), а не ротация, которую отправляет модуль.
+     * rotationYaw/rotationPitch во время PRE - это как раз то, что игрок видит у себя.
+     */
+    private float getPlayerYaw() {
+        return mc.getRenderViewEntity() != null
+                ? mc.getRenderViewEntity().rotationYaw
+                : mc.thePlayer.rotationYaw;
+    }
+
+    private float getPlayerPitch() {
+        return mc.getRenderViewEntity() != null
+                ? mc.getRenderViewEntity().rotationPitch
+                : mc.thePlayer.rotationPitch;
     }
 
     private boolean isFaceVisible(Vec3 eye, BlockPos pos, EnumFacing facing, Vec3 dir, double reach) {
@@ -317,9 +350,27 @@ public class Scaffold extends Module {
                                 o -> o.distanceSqToCenter((double) targetPos.getX() + 0.5, (double) targetPos.getY() + 0.5, (double) targetPos.getZ() + 0.5)
                         )
                 );
-                BlockPos blockPos = positions.get(0);
-                EnumFacing facing = this.getBestFacing(blockPos, targetPos);
-                return facing == null ? null : new BlockData(blockPos, facing);
+                // Смотрим не только на ближайшую опору: если у неё все грани за камерой,
+                // берём следующую. Иначе предсказанная грань оказывалась позади игрока.
+                int limit = Math.min(positions.size(), 8);
+                BlockData best = null;
+                double bestScore = -Double.MAX_VALUE;
+                for (int i = 0; i < limit; i++) {
+                    BlockPos support = positions.get(i);
+                    FaceChoice choice = this.pickBestFace(support, targetPos);
+                    if (choice == null) {
+                        continue;
+                    }
+                    double distance = support.distanceSqToCenter(
+                            (double) targetPos.getX() + 0.5, (double) targetPos.getY() + 0.5, (double) targetPos.getZ() + 0.5
+                    );
+                    double score = choice.score - distance * 0.5;
+                    if (best == null || score > bestScore) {
+                        bestScore = score;
+                        best = new BlockData(support, choice.facing);
+                    }
+                }
+                return best;
             }
         }
     }
@@ -329,12 +380,12 @@ public class Scaffold extends Module {
             return;
         }
         long currentTime = System.currentTimeMillis();
-        if (currentTime < this.nextClickTime) {
-            // У края (под ногами воздух) не ждём паузу паттерна - иначе теряем блок.
-            long minDelay = Math.max(50L, (long) this.placeDelay.getValue());
-            if (!this.isUrgentPlacement() || currentTime - this.lastPlaceTime < minDelay) {
-                return;
-            }
+        // 15 мс допуска: тик иногда чуть короче 50 мс, иначе теряется целый тик постановки.
+        boolean ready = currentTime + 15L >= this.nextClickTime;
+        boolean urgent = this.isUrgentPlacement()
+                && currentTime - this.lastPlaceTime >= Math.max(50L, (long) this.placeDelay.getValue());
+        if (!ready && !urgent) {
+            return;
         }
         if (ItemUtil.isHoldingBlock() && this.blockCount > 0) {
             if (mc.playerController.onPlayerRightClick(mc.thePlayer, mc.theWorld, mc.thePlayer.inventory.getCurrentItem(), blockPos, enumFacing, vec3)) {
@@ -826,7 +877,7 @@ public class Scaffold extends Module {
         float diagonalYaw = RotationUtil.wrapAngleDiff(
                 moveYaw - 135.0F * ((moveYaw + 180.0F) % 90.0F < 45.0F ? 1.0F : -1.0F), desiredYaw
         );
-        float playerYaw = mc.thePlayer.rotationYaw;
+        float playerYaw = this.getPlayerYaw();
         AimResult best = null;
         float bestScore = Float.MAX_VALUE;
         for (double[] point : Scaffold.aimPoints.get(facing)) {
@@ -835,6 +886,16 @@ public class Scaffold extends Module {
             );
             if (result == null || !result.visible) {
                 continue;
+            }
+            // Center/Random/Stabilized: не дёргаем голову на другой конец грани,
+            // если лучшая точка требует заметного отворота от взгляда игрока.
+            // Точки одной грани рядом, поэтому нормальная доводка проходит этот фильтр.
+            if (mode <= 2) {
+                float deviation = Math.abs(MathHelper.wrapAngleTo180_float(result.yaw - desiredYaw))
+                        + Math.abs(result.pitch - desiredPitch);
+                if (deviation > 30.0F) {
+                    continue;
+                }
             }
             float score = this.scoreAimPoint(mode, result, point, facing, reverseYaw, diagonalYaw, playerYaw, currentYaw, currentPitch);
             if (best == null || score < bestScore) {
@@ -924,7 +985,115 @@ public class Scaffold extends Module {
             double v = 0.2 + 0.6 * (double) ((hash >>> 24) & 0xFFL) / 255.0;
             return Scaffold.facePoint(facing, u, v, fixed);
         }
-        return Scaffold.faceCenters.get(facing);
+        // Center: берем точку, куда смотрит САМ игрок, зажатую внутрь грани.
+        // Тогда ротация минимальна, а луч гарантированно попадает в нужную грань.
+        double[] lookPoint = this.lookPointOnFace(pos, facing);
+        return lookPoint != null ? lookPoint : Scaffold.faceCenters.get(facing);
+    }
+
+    /**
+     * Пересечение взгляда игрока с плоскостью нужной грани, зажатое внутрь грани.
+     * Если игрок смотрит мимо грани - возвращает null, и берётся центр грани.
+     * Возвращает точку в локальных координатах блока (как facePoint).
+     */
+    private double[] lookPointOnFace(BlockPos pos, EnumFacing facing) {
+        Vec3 eye = this.getPredictedEyes();
+        Vec3 look = RotationUtil.getLookVec(this.getPlayerYaw(), this.getPlayerPitch());
+        double plane;
+        double denom;
+        switch (facing) {
+            case NORTH:
+                plane = pos.getZ();
+                denom = look.zCoord;
+                break;
+            case SOUTH:
+                plane = pos.getZ() + 1.0;
+                denom = look.zCoord;
+                break;
+            case WEST:
+                plane = pos.getX();
+                denom = look.xCoord;
+                break;
+            case EAST:
+                plane = pos.getX() + 1.0;
+                denom = look.xCoord;
+                break;
+            case UP:
+                plane = pos.getY() + 1.0;
+                denom = look.yCoord;
+                break;
+            case DOWN:
+                plane = pos.getY();
+                denom = look.yCoord;
+                break;
+            default:
+                return null;
+        }
+        if (Math.abs(denom) < 1.0E-4) {
+            return null;
+        }
+        double eyeCoord = facing == EnumFacing.NORTH || facing == EnumFacing.SOUTH
+                ? eye.zCoord
+                : facing == EnumFacing.WEST || facing == EnumFacing.EAST ? eye.xCoord : eye.yCoord;
+        double t = (plane - eyeCoord) / denom;
+        if (t <= 0.0) {
+            return null;
+        }
+        double hitX = eye.xCoord + look.xCoord * t;
+        double hitY = eye.yCoord + look.yCoord * t;
+        double hitZ = eye.zCoord + look.zCoord * t;
+        double rawU;
+        double rawV;
+        switch (facing) {
+            case NORTH:
+            case SOUTH:
+                rawU = hitX - (double) pos.getX();
+                rawV = hitY - (double) pos.getY();
+                break;
+            case WEST:
+            case EAST:
+                rawU = hitZ - (double) pos.getZ();
+                rawV = hitY - (double) pos.getY();
+                break;
+            default:
+                rawU = hitX - (double) pos.getX();
+                rawV = hitZ - (double) pos.getZ();
+        }
+        // Игрок смотрит не в эту грань (пересечение ушло далеко за её пределы):
+        // тогда точка взгляда не годится, иначе прицел уходит "чуть выше" грани.
+        // В этом случае вызывающий код возьмёт центр грани.
+        if (rawU < 0.0 || rawU > 1.0 || rawV < 0.0 || rawV > 1.0) {
+            return null;
+        }
+        // Отступ от краёв: луч не должен скользить по кромке грани,
+        // иначе он "перепрыгивает" на соседнюю грань/блок (визуально - прицел чуть выше).
+        double lo = 0.2;
+        double hi = 0.8;
+        // По вертикали держимся ближе к середине грани - это убирает наведение "чуть выше".
+        double vlo = 0.3;
+        double vhi = 0.7;
+        switch (facing) {
+            case NORTH:
+            case SOUTH:
+                return new double[]{
+                        MathHelper.clamp_double(rawU, lo, hi),
+                        MathHelper.clamp_double(rawV, vlo, vhi),
+                        plane - (double) pos.getZ()
+                };
+            case WEST:
+            case EAST:
+                return new double[]{
+                        plane - (double) pos.getX(),
+                        MathHelper.clamp_double(rawV, vlo, vhi),
+                        MathHelper.clamp_double(rawU, lo, hi)
+                };
+            default:
+                return new double[]{
+                        MathHelper.clamp_double(rawU, lo, hi),
+                        plane - (double) pos.getY(),
+                        MathHelper.clamp_double(rawV, lo, hi)
+                };
+        }
     }
 
     private static double facePointDistance(double[] point, EnumFacing facing) {
