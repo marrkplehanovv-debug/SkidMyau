@@ -146,16 +146,58 @@ public class Scaffold extends Module {
         }
     }
 
+    /**
+     * Блок ставится на уровень ног или выше (то есть "под себя, чтобы подняться")
+     * только если под ногами реально есть зазор. Стоя на земле без зазора такие
+     * цели не рассматриваются - чит не крутит голову вниз впустую.
+     * Прыжок самого скаффолда (tower/telly/keep-y) считается всегда: иначе keepY ломается.
+     */
+    private boolean isPlacementAllowed(BlockPos placed) {
+        if (placed.getY() < MathHelper.floor_double(mc.thePlayer.posY)) {
+            return true;
+        }
+        return this.hasGapBelow() || this.isScaffoldJump();
+    }
+
+    private boolean hasGapBelow() {
+        double feet = mc.thePlayer.posY - Math.floor(mc.thePlayer.posY);
+        if (feet > 0.05) {
+            return true;
+        }
+        return BlockUtil.isReplaceable(new BlockPos(
+                MathHelper.floor_double(mc.thePlayer.posX),
+                MathHelper.floor_double(mc.thePlayer.posY) - 1,
+                MathHelper.floor_double(mc.thePlayer.posZ)
+        ));
+    }
+
+    private boolean isScaffoldJump() {
+        return this.towering || this.isTowering() || this.stage > 0 || this.keepY.getValue() != 0;
+    }
+
     private EnumFacing getBestFacing(BlockPos blockPos1, BlockPos blockPos3) {
+        Vec3 eye = mc.thePlayer.getPositionEyes(1.0F);
+        Vec3 look = RotationUtil.getLookVec(mc.thePlayer.rotationYaw, mc.thePlayer.rotationPitch);
         double offset = 0.0;
         EnumFacing enumFacing = null;
         for (EnumFacing facing : EnumFacing.VALUES) {
             if (facing != EnumFacing.DOWN) {
                 BlockPos pos = blockPos1.offset(facing);
-                if (pos.getY() <= blockPos3.getY()) {
+                if (pos.getY() <= blockPos3.getY() && this.isPlacementAllowed(pos)) {
                     double distance = pos.distanceSqToCenter((double) blockPos3.getX() + 0.5, (double) blockPos3.getY() + 0.5, (double) blockPos3.getZ() + 0.5);
-                    if (enumFacing == null || distance < offset || distance == offset && facing == EnumFacing.UP) {
-                        offset = distance;
+                    // Приоритет - грань, в которую игрок уже смотрит: иначе при нескольких
+                    // равных кандидатах голова дёргается между гранями каждый тик.
+                    Vec3 center = new Vec3(
+                            (double) blockPos1.getX() + 0.5 + (double) facing.getFrontOffsetX() * 0.5,
+                            (double) blockPos1.getY() + 0.5 + (double) facing.getFrontOffsetY() * 0.5,
+                            (double) blockPos1.getZ() + 0.5 + (double) facing.getFrontOffsetZ() * 0.5
+                    );
+                    Vec3 dir = center.subtract(eye);
+                    double length = dir.lengthVector();
+                    double dot = length < 1.0E-6 ? 0.0 : (dir.xCoord * look.xCoord + dir.yCoord * look.yCoord + dir.zCoord * look.zCoord) / length;
+                    double score = dot * 4.0 - distance;
+                    if (enumFacing == null || score > offset || score == offset && facing == EnumFacing.UP) {
+                        offset = score;
                         enumFacing = facing;
                     }
                 }
@@ -199,6 +241,9 @@ public class Scaffold extends Module {
         if (!BlockUtil.isReplaceable(placed)) {
             return false;
         }
+        if (!this.isPlacementAllowed(placed)) {
+            return false;
+        }
         double reach = (double) mc.playerController.getBlockReachDistance() + 0.5;
         if (mc.thePlayer.getDistance(
                 (double) support.getX() + 0.5, (double) support.getY() + 0.5, (double) support.getZ() + 0.5
@@ -232,7 +277,7 @@ public class Scaffold extends Module {
                             for (EnumFacing facing : EnumFacing.VALUES) {
                                 if (facing != EnumFacing.DOWN) {
                                     BlockPos blockPos = pos.offset(facing);
-                                    if (BlockUtil.isReplaceable(blockPos)) {
+                                    if (BlockUtil.isReplaceable(blockPos) && this.isPlacementAllowed(blockPos)) {
                                         positions.add(pos);
                                     }
                                 }
@@ -530,7 +575,7 @@ public class Scaffold extends Module {
                 this.pendingHitVec = null;
                 if (blockData != null) {
                     this.pendingBlockData = blockData;
-                    if (aim != null) {
+                    if (aim != null && aim.hitVec != null) {
                         this.pendingHitVec = aim.hitVec;
                     } else if (!this.trueSight.getValue()) {
                         this.pendingHitVec = BlockUtil.getHitVec(blockData.blockPos(), blockData.facing(), this.yaw, this.pitch);
@@ -554,7 +599,7 @@ public class Scaffold extends Module {
         this.pendingBlockData = null;
         this.pendingHitVec = null;
         if (!hasTarget) {
-            this.clearDebug();
+            this.recordDebugRayOnly(yaw, pitch);
             return;
         }
         if (this.trueSight.getValue()) {
@@ -564,7 +609,7 @@ public class Scaffold extends Module {
             return;
         }
         if (hitVec == null) {
-            this.clearDebug();
+            this.recordDebugRayOnly(yaw, pitch);
             return;
         }
         this.place(blockData.blockPos(), blockData.facing(), hitVec);
@@ -631,9 +676,15 @@ public class Scaffold extends Module {
         this.place(support, side, mop.hitVec);
     }
 
-    private void clearDebug() {
-        this.debugEye = null;
-        this.debugHit = null;
+    /**
+     * Луч рисуем всегда, даже когда цели нет: видно, куда реально смотрит сервер.
+     */
+    private void recordDebugRayOnly(float yaw, float pitch) {
+        Vec3 eye = mc.thePlayer.getPositionEyes(1.0F);
+        Vec3 look = RotationUtil.getLookVec(yaw, pitch);
+        double reach = (double) mc.playerController.getBlockReachDistance();
+        this.debugEye = eye;
+        this.debugHit = eye.addVector(look.xCoord * reach, look.yCoord * reach, look.zCoord * reach);
         this.debugSupport = null;
         this.debugSide = null;
         this.debugPlacePos = null;
@@ -717,22 +768,28 @@ public class Scaffold extends Module {
         float yawLimit = applyLimits ? (float) this.yawLimit.getValue() : 180.0F;
         float pitchLimit = applyLimits ? (float) this.pitchLimit.getValue() : 90.0F;
         int mode = this.aimMode.getValue();
+        AimResult preferred = null;
         if (this.aimResult != null && pos.equals(this.aimResultPos) && facing == this.aimResultFacing) {
-            AimResult cached = this.checkAimPoint(
+            preferred = this.checkAimPoint(
                     pos, facing, this.aimResult.point, desiredYaw, desiredPitch, yawLimit, pitchLimit, reach, eye
             );
-            if (cached != null) {
-                this.aimResult = cached;
-                return cached;
+            if (preferred != null && preferred.visible) {
+                this.aimResult = preferred;
+                return preferred;
             }
         }
         if (mode <= 2) {
-            AimResult preferred = this.checkAimPoint(
+            AimResult fixedPoint = this.checkAimPoint(
                     pos, facing, this.preferredAimPoint(pos, facing, mode),
                     desiredYaw, desiredPitch, yawLimit, pitchLimit, reach, eye
             );
-            if (preferred != null) {
-                return this.rememberAim(pos, facing, preferred);
+            if (fixedPoint != null) {
+                if (fixedPoint.visible) {
+                    return this.rememberAim(pos, facing, fixedPoint);
+                }
+                if (preferred == null) {
+                    preferred = fixedPoint;
+                }
             }
         }
         float moveYaw = this.getCurrentYaw();
@@ -747,7 +804,7 @@ public class Scaffold extends Module {
             AimResult result = this.checkAimPoint(
                     pos, facing, point, desiredYaw, desiredPitch, yawLimit, pitchLimit, reach, eye
             );
-            if (result == null) {
+            if (result == null || !result.visible) {
                 continue;
             }
             float score = this.scoreAimPoint(mode, result, point, facing, reverseYaw, diagonalYaw, playerYaw, currentYaw, currentPitch);
@@ -756,7 +813,10 @@ public class Scaffold extends Module {
                 best = result;
             }
         }
-        return best == null ? null : this.rememberAim(pos, facing, best);
+        // Если видимой точки нет, всё равно наводимся на грань: иначе прицел "паркуется"
+        // и постановка ждёт лишние тики. Реальную постановку всё равно решает POST-рейкаст.
+        AimResult chosen = best != null ? best : preferred;
+        return chosen == null ? null : this.rememberAim(pos, facing, chosen);
     }
 
     private AimResult rememberAim(BlockPos pos, EnumFacing facing, AimResult aim) {
@@ -784,13 +844,11 @@ public class Scaffold extends Module {
             return null;
         }
         MovingObjectPosition mop = RotationUtil.rayTraceFrom(eye, rotations[0], rotations[1], reach);
-        if (mop != null
+        boolean visible = mop != null
                 && mop.typeOfHit == MovingObjectType.BLOCK
                 && mop.getBlockPos().equals(pos)
-                && mop.sideHit == facing) {
-            return new AimResult(rotations[0], rotations[1], mop.hitVec, point);
-        }
-        return null;
+                && mop.sideHit == facing;
+        return new AimResult(rotations[0], rotations[1], visible ? mop.hitVec : null, point, visible);
     }
 
     private float scoreAimPoint(
@@ -1314,12 +1372,14 @@ public class Scaffold extends Module {
         private final float pitch;
         private final Vec3 hitVec;
         private final double[] point;
+        private final boolean visible;
 
-        public AimResult(float yaw, float pitch, Vec3 hitVec, double[] point) {
+        public AimResult(float yaw, float pitch, Vec3 hitVec, double[] point, boolean visible) {
             this.yaw = yaw;
             this.pitch = pitch;
             this.hitVec = hitVec;
             this.point = point;
+            this.visible = visible;
         }
     }
 
