@@ -71,6 +71,9 @@ public class Scaffold extends Module {
     private float lastAimPitch = 0.0F;
     private int lastAimTick = 0;
     private int tickCounter = 0;
+    private long nextClickTime = 0L;
+    private int clickPatternIndex = 0;
+    private int dragBurst = 0;
     public final ModeProperty rotationMode = new ModeProperty("rotations", 2, new String[]{"NONE", "DEFAULT", "BACKWARDS", "SIDEWAYS"});
     public final ModeProperty aimMode = new ModeProperty(
             "rotation-mode",
@@ -88,6 +91,11 @@ public class Scaffold extends Module {
     public final BooleanProperty keepYonPress = new BooleanProperty("keep-y-on-press", false, () -> this.keepY.getValue() != 0);
     public final BooleanProperty disableWhileJumpActive = new BooleanProperty("no-keep-y-on-jump-potion", false, () -> this.keepY.getValue() != 0);
     public final IntProperty placeDelay = new IntProperty("place-delay", 50, 0, 500);
+    public final ModeProperty clickMode = new ModeProperty(
+            "click-mode",
+            0,
+            new String[]{"Off", "Butterfly", "DoubleClick", "DragClick"}
+    );
     public final IntProperty placeAhead = new IntProperty("place-ahead", 2, 0, 4);
     public final BooleanProperty trueSight = new BooleanProperty("true-sight", true);
     public final IntProperty rotationSpeed = new IntProperty("rotation-speed", 180, 1, 180, this::hasRotation);
@@ -238,13 +246,18 @@ public class Scaffold extends Module {
             return;
         }
         long currentTime = System.currentTimeMillis();
-        if (currentTime - this.lastPlaceTime < (long) this.placeDelay.getValue()) {
-            return;
+        if (currentTime < this.nextClickTime) {
+            // У края (под ногами воздух) не ждём паузу паттерна - иначе теряем блок.
+            long minDelay = Math.max(50L, (long) this.placeDelay.getValue());
+            if (!this.isUrgentPlacement() || currentTime - this.lastPlaceTime < minDelay) {
+                return;
+            }
         }
         if (ItemUtil.isHoldingBlock() && this.blockCount > 0) {
             if (mc.playerController.onPlayerRightClick(mc.thePlayer, mc.theWorld, mc.thePlayer.inventory.getCurrentItem(), blockPos, enumFacing, vec3)) {
                 this.lastPlaceTime = currentTime;
                 this.placedThisTick = true;
+                this.nextClickTime = currentTime + this.getClickDelay();
                 if (mc.playerController.getCurrentGameType() != GameType.CREATIVE) {
                     this.blockCount--;
                 }
@@ -255,6 +268,49 @@ public class Scaffold extends Module {
                 }
             }
         }
+    }
+
+    /**
+     * Задержка до следующего "клика" в зависимости от выбранной симуляции.
+     * place-delay остаётся минимальным интервалом, режим задаёт рисунок.
+     */
+    private long getClickDelay() {
+        long base = Math.max(0L, (long) this.placeDelay.getValue());
+        switch (this.clickMode.getValue()) {
+            case 1:
+                // Butterfly: ровные частые клики двумя "пальцами" - 1 тик / 2 тика
+                this.clickPatternIndex++;
+                return Math.max(base, this.clickPatternIndex % 2 == 0
+                        ? RandomUtil.nextLong(90L, 110L)
+                        : RandomUtil.nextLong(45L, 55L));
+            case 2:
+                // DoubleClick: пара быстрых кликов и пауза
+                this.clickPatternIndex++;
+                return Math.max(base, this.clickPatternIndex % 3 == 2
+                        ? RandomUtil.nextLong(170L, 250L)
+                        : RandomUtil.nextLong(45L, 60L));
+            case 3:
+                // DragClick: серия быстрых кликов, затем отдых
+                if (this.dragBurst <= 0) {
+                    this.dragBurst = (int) RandomUtil.nextLong(4L, 8L);
+                    return Math.max(base, RandomUtil.nextLong(300L, 500L));
+                }
+                this.dragBurst--;
+                return Math.max(base, RandomUtil.nextLong(45L, 55L));
+            default:
+                return base;
+        }
+    }
+
+    /**
+     * Игрок стоит над пустотой - блок нужен прямо сейчас, паттерн кликов не должен тормозить.
+     */
+    private boolean isUrgentPlacement() {
+        return BlockUtil.isReplaceable(new BlockPos(
+                MathHelper.floor_double(mc.thePlayer.posX),
+                MathHelper.floor_double(mc.thePlayer.posY) - 1,
+                MathHelper.floor_double(mc.thePlayer.posZ)
+        ));
     }
 
     private EnumFacing yawToFacing(float yaw) {
@@ -393,21 +449,16 @@ public class Scaffold extends Module {
                 this.pitch = desiredPitch;
                 BlockData blockData = this.getBlockData();
                 if (this.targetFacing != null) {
-                    if (this.rotationTick <= 0) {
-                        int playerBlockX = MathHelper.floor_double(mc.thePlayer.posX);
-                        int playerBlockY = MathHelper.floor_double(mc.thePlayer.posY);
-                        int playerBlockZ = MathHelper.floor_double(mc.thePlayer.posZ);
-                        blockData = new BlockData(new BlockPos(playerBlockX, playerBlockY - 1, playerBlockZ), this.targetFacing);
-                    } else {
-                        blockData = null;
-                    }
+                    int playerBlockX = MathHelper.floor_double(mc.thePlayer.posX);
+                    int playerBlockY = MathHelper.floor_double(mc.thePlayer.posY);
+                    int playerBlockZ = MathHelper.floor_double(mc.thePlayer.posZ);
+                    blockData = new BlockData(new BlockPos(playerBlockX, playerBlockY - 1, playerBlockZ), this.targetFacing);
                     this.targetFacing = null;
                 } else if (this.keepY.getValue() == 2 && this.stage > 0 && !mc.thePlayer.onGround) {
                     int nextBlockY = MathHelper.floor_double(mc.thePlayer.posY + mc.thePlayer.motionY);
                     if (nextBlockY <= this.startY && mc.thePlayer.posY > (double) (this.startY + 1)) {
                         this.shouldKeepY = true;
-                        BlockData keepData = this.getBlockData();
-                        blockData = keepData != null && this.rotationTick <= 0 ? keepData : null;
+                        blockData = this.getBlockData();
                     }
                 }
                 AimResult aim = this.findAim(blockData, desiredYaw, desiredPitch, event.getYaw(), event.getPitch(), this.rotationMode.getValue() != 0);
@@ -447,12 +498,11 @@ public class Scaffold extends Module {
                 this.pitch = sentPitch;
                 this.pendingBlockData = null;
                 this.pendingHitVec = null;
-                if (blockData != null && this.rotationTick <= 0) {
+                if (blockData != null) {
+                    this.pendingBlockData = blockData;
                     if (aim != null) {
-                        this.pendingBlockData = blockData;
                         this.pendingHitVec = aim.hitVec;
                     } else if (!this.trueSight.getValue()) {
-                        this.pendingBlockData = blockData;
                         this.pendingHitVec = BlockUtil.getHitVec(blockData.blockPos(), blockData.facing(), this.yaw, this.pitch);
                     }
                 }
@@ -470,27 +520,70 @@ public class Scaffold extends Module {
     private void placePending(float yaw, float pitch) {
         BlockData blockData = this.pendingBlockData;
         Vec3 hitVec = this.pendingHitVec;
+        boolean hasTarget = blockData != null;
         this.pendingBlockData = null;
         this.pendingHitVec = null;
-        if (blockData == null || hitVec == null || this.rotationTick > 0) {
+        if (!hasTarget) {
             return;
         }
         if (this.trueSight.getValue()) {
-            MovingObjectPosition mop = RotationUtil.rayTrace(yaw, pitch, mc.playerController.getBlockReachDistance(), 1.0F);
-            if (mop == null || mop.typeOfHit != MovingObjectType.BLOCK) {
-                return;
-            }
-            if (mop.getBlockPos().equals(blockData.blockPos()) && mop.sideHit == blockData.facing()) {
-                hitVec = mop.hitVec;
-            } else if (mop.getBlockPos().equals(blockData.blockPos())) {
-                // из-за движения грань сместилась - ставим в ту, которую реально видим
-                hitVec = mop.hitVec;
-                blockData = new BlockData(mop.getBlockPos(), mop.sideHit);
-            } else {
-                return;
-            }
+            // Ставим ровно то, что реально видно отправленной ротацией:
+            // клик происходит, как только луч попадает в блок, а не после "доводки" прицела.
+            this.placeByRayTrace(yaw, pitch, blockData);
+            return;
+        }
+        if (hitVec == null) {
+            return;
         }
         this.place(blockData.blockPos(), blockData.facing(), hitVec);
+    }
+
+    private void placeByRayTrace(float yaw, float pitch, BlockData target) {
+        if (!ItemUtil.isHoldingBlock() || this.blockCount <= 0) {
+            return;
+        }
+        double reach = (double) mc.playerController.getBlockReachDistance();
+        Vec3 eye = mc.thePlayer.getPositionEyes(1.0F);
+        MovingObjectPosition mop = RotationUtil.rayTraceFrom(eye, yaw, pitch, reach);
+        if (mop == null || mop.typeOfHit != MovingObjectType.BLOCK) {
+            return;
+        }
+        BlockPos support = mop.getBlockPos();
+        EnumFacing side = mop.sideHit;
+        BlockPos placePos = support.offset(side);
+        if (!BlockUtil.isReplaceable(placePos) || BlockUtil.isInteractable(placePos)) {
+            return;
+        }
+        if (this.intersectsPlayer(placePos)) {
+            return;
+        }
+        if (placePos.getY() > MathHelper.floor_double(mc.thePlayer.posY) - 1) {
+            return;
+        }
+        BlockPos targetPos = this.getTargetPos();
+        if (placePos.distanceSqToCenter(
+                (double) targetPos.getX() + 0.5, (double) targetPos.getY() + 0.5, (double) targetPos.getZ() + 0.5
+        ) > 16.0) {
+            return;
+        }
+        if (BlockUtil.isReplaceable(support) || BlockUtil.isInteractable(support)) {
+            return;
+        }
+        BlockPos expected = target.blockPos();
+        if (support.distanceSqToCenter(
+                (double) expected.getX() + 0.5, (double) expected.getY() + 0.5, (double) expected.getZ() + 0.5
+        ) > 25.0) {
+            return;
+        }
+        this.place(support, side, mop.hitVec);
+    }
+
+    private boolean intersectsPlayer(BlockPos pos) {
+        AxisAlignedBB block = new AxisAlignedBB(
+                pos.getX(), pos.getY(), pos.getZ(),
+                pos.getX() + 1, pos.getY() + 1, pos.getZ() + 1
+        );
+        return mc.thePlayer.getEntityBoundingBox().intersectsWith(block);
     }
 
     private float[] stepRotation(float currentYaw, float currentPitch, float targetYaw, float targetPitch) {
@@ -524,6 +617,19 @@ public class Scaffold extends Module {
     }
 
     /**
+     * Глаза на момент POST (после применения движения за этот тик).
+     * C08 уходит уже из новой позиции, поэтому прицел надо считать от неё,
+     * иначе PRE и POST рейкасты не совпадают и блок ставится только стоя на краю.
+     */
+    private Vec3 getPredictedEyes() {
+        return new Vec3(
+                mc.thePlayer.posX + mc.thePlayer.motionX,
+                mc.thePlayer.posY + mc.thePlayer.motionY + (double) mc.thePlayer.getEyeHeight(),
+                mc.thePlayer.posZ + mc.thePlayer.motionZ
+        );
+    }
+
+    /**
      * Ищет точку на нужной грани блока, попадание в которую даёт валидный рейкаст.
      * Первым проверяется центр грани (самая устойчивая точка), затем внутренние
      * точки, и только в конце - полная сетка.
@@ -535,15 +641,13 @@ public class Scaffold extends Module {
         BlockPos pos = blockData.blockPos();
         EnumFacing facing = blockData.facing();
         double reach = (double) mc.playerController.getBlockReachDistance();
-        double eyeX = mc.thePlayer.posX;
-        double eyeY = mc.thePlayer.posY + (double) mc.thePlayer.getEyeHeight();
-        double eyeZ = mc.thePlayer.posZ;
+        Vec3 eye = this.getPredictedEyes();
         float yawLimit = applyLimits ? (float) this.yawLimit.getValue() : 180.0F;
         float pitchLimit = applyLimits ? (float) this.pitchLimit.getValue() : 90.0F;
         int mode = this.aimMode.getValue();
         if (this.aimResult != null && pos.equals(this.aimResultPos) && facing == this.aimResultFacing) {
             AimResult cached = this.checkAimPoint(
-                    pos, facing, this.aimResult.point, desiredYaw, desiredPitch, yawLimit, pitchLimit, reach, eyeX, eyeY, eyeZ
+                    pos, facing, this.aimResult.point, desiredYaw, desiredPitch, yawLimit, pitchLimit, reach, eye
             );
             if (cached != null) {
                 this.aimResult = cached;
@@ -553,7 +657,7 @@ public class Scaffold extends Module {
         if (mode <= 2) {
             AimResult preferred = this.checkAimPoint(
                     pos, facing, this.preferredAimPoint(pos, facing, mode),
-                    desiredYaw, desiredPitch, yawLimit, pitchLimit, reach, eyeX, eyeY, eyeZ
+                    desiredYaw, desiredPitch, yawLimit, pitchLimit, reach, eye
             );
             if (preferred != null) {
                 return this.rememberAim(pos, facing, preferred);
@@ -569,7 +673,7 @@ public class Scaffold extends Module {
         float bestScore = Float.MAX_VALUE;
         for (double[] point : Scaffold.aimPoints.get(facing)) {
             AimResult result = this.checkAimPoint(
-                    pos, facing, point, desiredYaw, desiredPitch, yawLimit, pitchLimit, reach, eyeX, eyeY, eyeZ
+                    pos, facing, point, desiredYaw, desiredPitch, yawLimit, pitchLimit, reach, eye
             );
             if (result == null) {
                 continue;
@@ -593,13 +697,13 @@ public class Scaffold extends Module {
     private AimResult checkAimPoint(
             BlockPos pos, EnumFacing facing, double[] point,
             float desiredYaw, float desiredPitch, float yawLimit, float pitchLimit,
-            double reach, double eyeX, double eyeY, double eyeZ
+            double reach, Vec3 eye
     ) {
         double targetX = (double) pos.getX() + point[0];
         double targetY = (double) pos.getY() + point[1];
         double targetZ = (double) pos.getZ() + point[2];
         float[] rotations = RotationUtil.getRotationsToRaw(
-                targetX - eyeX, targetY - eyeY, targetZ - eyeZ, desiredYaw, desiredPitch
+                targetX - eye.xCoord, targetY - eye.yCoord, targetZ - eye.zCoord, desiredYaw, desiredPitch
         );
         if (Math.abs(MathHelper.wrapAngleTo180_float(rotations[0] - desiredYaw)) > yawLimit) {
             return null;
@@ -607,7 +711,7 @@ public class Scaffold extends Module {
         if (Math.abs(rotations[1]) > pitchLimit) {
             return null;
         }
-        MovingObjectPosition mop = RotationUtil.rayTrace(rotations[0], rotations[1], reach, 1.0F);
+        MovingObjectPosition mop = RotationUtil.rayTraceFrom(eye, rotations[0], rotations[1], reach);
         if (mop != null
                 && mop.typeOfHit == MovingObjectType.BLOCK
                 && mop.getBlockPos().equals(pos)
@@ -998,6 +1102,9 @@ public class Scaffold extends Module {
         this.stableBlockDataAge = 0;
         this.lastAimTick = 0;
         this.tickCounter = 0;
+        this.nextClickTime = 0L;
+        this.clickPatternIndex = 0;
+        this.dragBurst = 0;
     }
 
     @Override
