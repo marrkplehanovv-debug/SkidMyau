@@ -6,6 +6,7 @@ import skidmyau.event.types.EventType;
 import skidmyau.event.types.Priority;
 import skidmyau.events.*;
 import skidmyau.management.RotationState;
+import skidmyau.mixin.IAccessorRenderManager;
 import skidmyau.module.Module;
 import skidmyau.property.properties.BooleanProperty;
 import skidmyau.property.properties.IntProperty;
@@ -16,6 +17,9 @@ import net.minecraft.block.Block;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.ScaledResolution;
 import net.minecraft.client.renderer.GlStateManager;
+import net.minecraft.client.renderer.Tessellator;
+import net.minecraft.client.renderer.WorldRenderer;
+import net.minecraft.client.renderer.vertex.DefaultVertexFormats;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemBlock;
 import net.minecraft.item.ItemStack;
@@ -74,6 +78,14 @@ public class Scaffold extends Module {
     private long nextClickTime = 0L;
     private int clickPatternIndex = 0;
     private int dragBurst = 0;
+    private Vec3 debugEye = null;
+    private Vec3 debugHit = null;
+    private BlockPos debugSupport = null;
+    private EnumFacing debugSide = null;
+    private BlockPos debugPlacePos = null;
+    private BlockPos debugTarget = null;
+    private boolean debugValid = false;
+    private String debugReason = "";
     public final ModeProperty rotationMode = new ModeProperty("rotations", 2, new String[]{"NONE", "DEFAULT", "BACKWARDS", "SIDEWAYS"});
     public final ModeProperty aimMode = new ModeProperty(
             "rotation-mode",
@@ -96,6 +108,9 @@ public class Scaffold extends Module {
             0,
             new String[]{"Off", "Butterfly", "DoubleClick", "DragClick"}
     );
+    public final IntProperty clickCpsMin = new IntProperty("click-cps-min", 10, 1, 20, () -> this.clickMode.getValue() != 0);
+    public final IntProperty clickCpsMax = new IntProperty("click-cps-max", 14, 1, 20, () -> this.clickMode.getValue() != 0);
+    public final BooleanProperty debug = new BooleanProperty("debug", false);
     public final IntProperty placeAhead = new IntProperty("place-ahead", 2, 0, 4);
     public final BooleanProperty trueSight = new BooleanProperty("true-sight", true);
     public final IntProperty rotationSpeed = new IntProperty("rotation-speed", 180, 1, 180, this::hasRotation);
@@ -271,35 +286,50 @@ public class Scaffold extends Module {
     }
 
     /**
-     * Задержка до следующего "клика" в зависимости от выбранной симуляции.
-     * place-delay остаётся минимальным интервалом, режим задаёт рисунок.
+     * Задержка до следующего "клика". База берётся из CPS-диапазона
+     * (как в LiquidBounce), а режим задаёт рисунок: бабочка, дабл-клик, драг.
+     * place-delay остаётся нижней границей, тик (50 мс) - физическим пределом.
      */
     private long getClickDelay() {
-        long base = Math.max(0L, (long) this.placeDelay.getValue());
-        switch (this.clickMode.getValue()) {
+        long base = Math.max(50L, (long) this.placeDelay.getValue());
+        int mode = this.clickMode.getValue();
+        if (mode == 0) {
+            return base;
+        }
+        double minCps = this.clickCpsMin.getValue();
+        double maxCps = this.clickCpsMax.getValue();
+        if (maxCps < minCps) {
+            maxCps = minCps;
+        }
+        double avgPeriod = 1000.0 / ((minCps + maxCps) * 0.5);
+        double fastPeriod = 1000.0 / maxCps;
+        long delay;
+        switch (mode) {
             case 1:
-                // Butterfly: ровные частые клики двумя "пальцами" - 1 тик / 2 тика
+                // Butterfly: два "пальца" - короткий интервал, потом длинный
                 this.clickPatternIndex++;
-                return Math.max(base, this.clickPatternIndex % 2 == 0
-                        ? RandomUtil.nextLong(90L, 110L)
-                        : RandomUtil.nextLong(45L, 55L));
+                delay = Math.round(this.clickPatternIndex % 2 == 0 ? avgPeriod * 1.35 : avgPeriod * 0.65);
+                break;
             case 2:
-                // DoubleClick: пара быстрых кликов и пауза
+                // DoubleClick: быстрый дубль и пауза
                 this.clickPatternIndex++;
-                return Math.max(base, this.clickPatternIndex % 3 == 2
-                        ? RandomUtil.nextLong(170L, 250L)
-                        : RandomUtil.nextLong(45L, 60L));
+                delay = Math.round(this.clickPatternIndex % 3 == 2 ? avgPeriod * 1.6 : avgPeriod * 0.7);
+                break;
             case 3:
-                // DragClick: серия быстрых кликов, затем отдых
+                // DragClick: серия быстрых кликов, затем отдых (средний CPS сохраняется)
                 if (this.dragBurst <= 0) {
                     this.dragBurst = (int) RandomUtil.nextLong(4L, 8L);
-                    return Math.max(base, RandomUtil.nextLong(300L, 500L));
+                    delay = Math.round(fastPeriod * this.dragBurst * 2.0);
+                } else {
+                    this.dragBurst--;
+                    delay = Math.round(fastPeriod * 0.9);
                 }
-                this.dragBurst--;
-                return Math.max(base, RandomUtil.nextLong(45L, 55L));
+                break;
             default:
-                return base;
+                delay = Math.round(avgPeriod);
         }
+        delay += (long) RandomUtil.nextLong(-5L, 5L);
+        return Math.max(base, Math.max(40L, delay));
     }
 
     /**
@@ -524,6 +554,7 @@ public class Scaffold extends Module {
         this.pendingBlockData = null;
         this.pendingHitVec = null;
         if (!hasTarget) {
+            this.clearDebug();
             return;
         }
         if (this.trueSight.getValue()) {
@@ -533,49 +564,82 @@ public class Scaffold extends Module {
             return;
         }
         if (hitVec == null) {
+            this.clearDebug();
             return;
         }
         this.place(blockData.blockPos(), blockData.facing(), hitVec);
     }
 
     private void placeByRayTrace(float yaw, float pitch, BlockData target) {
-        if (!ItemUtil.isHoldingBlock() || this.blockCount <= 0) {
-            return;
-        }
         double reach = (double) mc.playerController.getBlockReachDistance();
         Vec3 eye = mc.thePlayer.getPositionEyes(1.0F);
+        Vec3 look = RotationUtil.getLookVec(yaw, pitch);
         MovingObjectPosition mop = RotationUtil.rayTraceFrom(eye, yaw, pitch, reach);
-        if (mop == null || mop.typeOfHit != MovingObjectType.BLOCK) {
+        boolean hit = mop != null && mop.typeOfHit == MovingObjectType.BLOCK;
+        BlockPos support = hit ? mop.getBlockPos() : target.blockPos();
+        EnumFacing side = hit ? mop.sideHit : target.facing();
+        BlockPos placePos = support.offset(side);
+        this.debugEye = eye;
+        this.debugHit = hit
+                ? mop.hitVec
+                : eye.addVector(look.xCoord * reach, look.yCoord * reach, look.zCoord * reach);
+        this.debugSupport = support;
+        this.debugSide = side;
+        this.debugPlacePos = placePos;
+        this.debugTarget = target.blockPos();
+        this.debugValid = false;
+        if (!ItemUtil.isHoldingBlock() || this.blockCount <= 0) {
+            this.debugReason = "no block in hand";
             return;
         }
-        BlockPos support = mop.getBlockPos();
-        EnumFacing side = mop.sideHit;
-        BlockPos placePos = support.offset(side);
+        if (!hit) {
+            this.debugReason = "ray missed";
+            return;
+        }
         if (!BlockUtil.isReplaceable(placePos) || BlockUtil.isInteractable(placePos)) {
+            this.debugReason = "place pos not free";
             return;
         }
         if (this.intersectsPlayer(placePos)) {
+            this.debugReason = "place pos inside player";
             return;
         }
         if (placePos.getY() > MathHelper.floor_double(mc.thePlayer.posY) - 1) {
+            this.debugReason = "place pos above feet";
             return;
         }
         BlockPos targetPos = this.getTargetPos();
         if (placePos.distanceSqToCenter(
                 (double) targetPos.getX() + 0.5, (double) targetPos.getY() + 0.5, (double) targetPos.getZ() + 0.5
         ) > 16.0) {
+            this.debugReason = "place pos too far from target";
             return;
         }
         if (BlockUtil.isReplaceable(support) || BlockUtil.isInteractable(support)) {
+            this.debugReason = "support not solid";
             return;
         }
         BlockPos expected = target.blockPos();
         if (support.distanceSqToCenter(
                 (double) expected.getX() + 0.5, (double) expected.getY() + 0.5, (double) expected.getZ() + 0.5
         ) > 25.0) {
+            this.debugReason = "support too far from target";
             return;
         }
+        this.debugValid = true;
+        this.debugReason = "ok";
         this.place(support, side, mop.hitVec);
+    }
+
+    private void clearDebug() {
+        this.debugEye = null;
+        this.debugHit = null;
+        this.debugSupport = null;
+        this.debugSide = null;
+        this.debugPlacePos = null;
+        this.debugTarget = null;
+        this.debugValid = false;
+        this.debugReason = "no target";
     }
 
     private boolean intersectsPlayer(BlockPos pos) {
@@ -622,9 +686,17 @@ public class Scaffold extends Module {
      * иначе PRE и POST рейкасты не совпадают и блок ставится только стоя на краю.
      */
     private Vec3 getPredictedEyes() {
+        double dy = 0.0;
+        if (!mc.thePlayer.onGround) {
+            dy = mc.thePlayer.motionY;
+            if (!mc.thePlayer.capabilities.isFlying && !mc.thePlayer.isInWater() && !mc.thePlayer.isInLava()) {
+                // гравитация применяется до движения в этом же тике
+                dy = (dy - 0.08) * 0.98;
+            }
+        }
         return new Vec3(
                 mc.thePlayer.posX + mc.thePlayer.motionX,
-                mc.thePlayer.posY + mc.thePlayer.motionY + (double) mc.thePlayer.getEyeHeight(),
+                mc.thePlayer.posY + dy + (double) mc.thePlayer.getEyeHeight(),
                 mc.thePlayer.posZ + mc.thePlayer.motionZ
         );
     }
@@ -1007,6 +1079,92 @@ public class Scaffold extends Module {
     }
 
     @EventTarget
+    public void onRender3D(Render3DEvent event) {
+        if (!this.isEnabled() || !this.debug.getValue()) {
+            return;
+        }
+        IAccessorRenderManager rm = (IAccessorRenderManager) mc.getRenderManager();
+        double rx = rm.getRenderPosX();
+        double ry = rm.getRenderPosY();
+        double rz = rm.getRenderPosZ();
+        RenderUtil.enableRenderState();
+        if (this.debugSupport != null && this.debugSide != null) {
+            // Блок, в который смотрит true-sight
+            RenderUtil.drawBoundingBox(
+                    new AxisAlignedBB(
+                            this.debugSupport.getX(), this.debugSupport.getY(), this.debugSupport.getZ(),
+                            this.debugSupport.getX() + 1.0, this.debugSupport.getY() + 1.0, this.debugSupport.getZ() + 1.0
+                    ).offset(-rx, -ry, -rz),
+                    255, 215, 60, 200, 2.0F
+            );
+            // Грань, в которую уйдёт блок
+            RenderUtil.drawFilledBox(
+                    Scaffold.faceBox(this.debugSupport, this.debugSide).offset(-rx, -ry, -rz),
+                    255, 215, 60
+            );
+        }
+        if (this.debugPlacePos != null) {
+            int red = this.debugValid ? 90 : 255;
+            int green = this.debugValid ? 255 : 70;
+            RenderUtil.drawBoundingBox(
+                    new AxisAlignedBB(
+                            this.debugPlacePos.getX(), this.debugPlacePos.getY(), this.debugPlacePos.getZ(),
+                            this.debugPlacePos.getX() + 1.0, this.debugPlacePos.getY() + 1.0, this.debugPlacePos.getZ() + 1.0
+                    ).offset(-rx, -ry, -rz),
+                    red, green, 80, this.debugValid ? 200 : 110, 2.0F
+            );
+        }
+        if (this.debugEye != null && this.debugHit != null) {
+            // Линия от головы до предполагаемого блока (то, что реально видит сервер)
+            int red = this.debugValid ? 90 : 255;
+            int green = this.debugValid ? 255 : 70;
+            this.drawDebugLine(
+                    new Vec3(this.debugEye.xCoord - rx, this.debugEye.yCoord - ry, this.debugEye.zCoord - rz),
+                    new Vec3(this.debugHit.xCoord - rx, this.debugHit.yCoord - ry, this.debugHit.zCoord - rz),
+                    red, green, 80
+            );
+        }
+        RenderUtil.disableRenderState();
+    }
+
+    private void drawDebugLine(Vec3 from, Vec3 to, int red, int green, int blue) {
+        Tessellator tessellator = Tessellator.getInstance();
+        WorldRenderer renderer = tessellator.getWorldRenderer();
+        GL11.glLineWidth(2.0F);
+        GL11.glEnable(GL11.GL_LINE_SMOOTH);
+        GL11.glHint(GL11.GL_LINE_SMOOTH_HINT, GL11.GL_NICEST);
+        renderer.begin(3, DefaultVertexFormats.POSITION_COLOR);
+        renderer.pos(from.xCoord, from.yCoord, from.zCoord).color(red, green, blue, 255).endVertex();
+        renderer.pos(to.xCoord, to.yCoord, to.zCoord).color(red, green, blue, 255).endVertex();
+        tessellator.draw();
+        GL11.glDisable(GL11.GL_LINE_SMOOTH);
+        GL11.glLineWidth(1.0F);
+    }
+
+    private static AxisAlignedBB faceBox(BlockPos pos, EnumFacing side) {
+        double x = pos.getX();
+        double y = pos.getY();
+        double z = pos.getZ();
+        double e = 0.01;
+        switch (side) {
+            case UP:
+                return new AxisAlignedBB(x, y + 1.0 - e, z, x + 1.0, y + 1.0 + e, z + 1.0);
+            case DOWN:
+                return new AxisAlignedBB(x, y - e, z, x + 1.0, y + e, z + 1.0);
+            case NORTH:
+                return new AxisAlignedBB(x, y, z - e, x + 1.0, y + 1.0, z + e);
+            case SOUTH:
+                return new AxisAlignedBB(x, y, z + 1.0 - e, x + 1.0, y + 1.0, z + 1.0 + e);
+            case WEST:
+                return new AxisAlignedBB(x - e, y, z, x + e, y + 1.0, z + 1.0);
+            case EAST:
+                return new AxisAlignedBB(x + 1.0 - e, y, z, x + 1.0 + e, y + 1.0, z + 1.0);
+            default:
+                return new AxisAlignedBB(x, y, z, x + 1.0, y + 1.0, z + 1.0);
+        }
+    }
+
+    @EventTarget
     public void onRender(Render2DEvent event) {
         if (this.isEnabled()) {
             if (this.blockCounter.getValue()) {
@@ -1042,6 +1200,31 @@ public class Scaffold extends Module {
                 GlStateManager.enableDepth();
                 GlStateManager.popMatrix();
             }
+            if (this.debug.getValue()) {
+                this.renderDebugText();
+            }
+        }
+    }
+
+    private void renderDebugText() {
+        ScaledResolution resolution = new ScaledResolution(mc);
+        float x = 4.0F;
+        float y = (float) resolution.getScaledHeight() - 10.0F;
+        String[] lines = new String[]{
+                String.format("true-sight: %s", this.debugReason),
+                String.format("eye %.2f %.2f %.2f", this.debugEye == null ? 0.0 : this.debugEye.xCoord,
+                        this.debugEye == null ? 0.0 : this.debugEye.yCoord,
+                        this.debugEye == null ? 0.0 : this.debugEye.zCoord),
+                String.format("target: %s side: %s", this.debugTarget == null ? "-" : this.debugTarget.toString(),
+                        this.debugSide == null ? "-" : this.debugSide.name()),
+                String.format("place: %s", this.debugPlacePos == null ? "-" : this.debugPlacePos.toString()),
+                String.format("click: %d ms | keep-y %d stage %d keep %s rot %d",
+                        Math.max(0L, this.nextClickTime - System.currentTimeMillis()),
+                        this.keepY.getValue(), this.stage, this.shouldKeepY, this.rotationTick)
+        };
+        for (String line : lines) {
+            y -= (float) (mc.fontRendererObj.FONT_HEIGHT + 1);
+            mc.fontRendererObj.drawString(line, x, y, Color.WHITE.getRGB(), true);
         }
     }
 
@@ -1071,6 +1254,15 @@ public class Scaffold extends Module {
         if (this.isEnabled()) {
             this.lastSlot = event.setSlot(this.lastSlot);
             event.setCancelled(true);
+        }
+    }
+
+    @Override
+    public void verifyValue(String mode) {
+        if (this.clickCpsMin.getName().equals(mode) && this.clickCpsMin.getValue() > this.clickCpsMax.getValue()) {
+            this.clickCpsMax.setValue(this.clickCpsMin.getValue());
+        } else if (this.clickCpsMax.getName().equals(mode) && this.clickCpsMax.getValue() < this.clickCpsMin.getValue()) {
+            this.clickCpsMin.setValue(this.clickCpsMax.getValue());
         }
     }
 
