@@ -32,7 +32,6 @@ import org.lwjgl.opengl.GL11;
 
 import java.awt.*;
 import java.util.ArrayList;
-import java.util.Comparator;
 
 public class Scaffold extends Module {
     private static final Minecraft mc = Minecraft.getMinecraft();
@@ -111,7 +110,7 @@ public class Scaffold extends Module {
     public final IntProperty clickCpsMin = new IntProperty("click-cps-min", 10, 1, 20, () -> this.clickMode.getValue() != 0);
     public final IntProperty clickCpsMax = new IntProperty("click-cps-max", 14, 1, 20, () -> this.clickMode.getValue() != 0);
     public final BooleanProperty debug = new BooleanProperty("debug", false);
-    public final IntProperty placeAhead = new IntProperty("place-ahead", 3, 0, 5);
+    public final IntProperty placeAhead = new IntProperty("place-ahead", 10, 0, 25);
     public final BooleanProperty trueSight = new BooleanProperty("true-sight", true);
     public final IntProperty rotationSpeed = new IntProperty("rotation-speed", 180, 1, 180, this::hasRotation);
     public final IntProperty pitchSpeed = new IntProperty("pitch-speed", 90, 1, 90, this::hasRotation);
@@ -180,59 +179,44 @@ public class Scaffold extends Module {
     }
 
     /**
-     * Оценивает все грани опоры и возвращает лучшую вместе с её скором.
+     * Скор одной грани опоры.
      * Приоритет: грань перед камерой игрока (а не перед "клиентским" взглядом модуля),
-     * которую реально видно из предсказанных глаз, и в которую игрок уже смотрит.
-     * Грань, которая находится ЗА камерой игрока, не рассматривается вообще:
-     * именно из-за этого раньше предсказанная грань оказывалась сзади.
+     * которую реально видно из предсказанных глаз. Грань за камерой не запрещена
+     * полностью: она используется только если спереди подходящих граней нет
+     * (это нужно для telly/backwards, где блок ставится за спину).
+     * NaN = грань не достать.
      */
-    private FaceChoice pickBestFace(BlockPos support, BlockPos targetPos) {
-        Vec3 eye = this.getPredictedEyes();
-        Vec3 look = RotationUtil.getLookVec(this.getPlayerYaw(), this.getPlayerPitch());
-        double reach = (double) mc.playerController.getBlockReachDistance();
-        FaceChoice best = null;
-        for (EnumFacing facing : EnumFacing.VALUES) {
-            if (facing == EnumFacing.DOWN) {
-                continue;
-            }
-            BlockPos placed = support.offset(facing);
-            if (placed.getY() > targetPos.getY() || !this.isPlacementAllowed(placed)) {
-                continue;
-            }
-            Vec3 center = new Vec3(
-                    (double) support.getX() + 0.5 + (double) facing.getFrontOffsetX() * 0.5,
-                    (double) support.getY() + 0.5 + (double) facing.getFrontOffsetY() * 0.5,
-                    (double) support.getZ() + 0.5 + (double) facing.getFrontOffsetZ() * 0.5
-            );
-            Vec3 dir = center.subtract(eye);
-            double length = dir.lengthVector();
-            double dot = length < 1.0E-6 ? 0.0 : (dir.xCoord * look.xCoord + dir.yCoord * look.yCoord + dir.zCoord * look.zCoord) / length;
-            if (dot <= 0.0) {
-                // Грань за камерой игрока - не кандидат.
-                continue;
-            }
-            double distance = placed.distanceSqToCenter(
-                    (double) targetPos.getX() + 0.5, (double) targetPos.getY() + 0.5, (double) targetPos.getZ() + 0.5
-            );
-            double score = dot * 4.0 - distance;
-            if (this.isFaceVisible(eye, support, facing, dir, reach)) {
-                score += 10.0;
-            }
-            if (best == null || score > best.score) {
-                best = new FaceChoice(facing, score);
+    private double scoreFace(BlockPos support, EnumFacing facing, Vec3 eye, Vec3 look, double reach) {
+        Vec3 center = new Vec3(
+                (double) support.getX() + 0.5 + (double) facing.getFrontOffsetX() * 0.5,
+                (double) support.getY() + 0.5 + (double) facing.getFrontOffsetY() * 0.5,
+                (double) support.getZ() + 0.5 + (double) facing.getFrontOffsetZ() * 0.5
+        );
+        Vec3 dir = center.subtract(eye);
+        double length = dir.lengthVector();
+        if (length > reach + 1.0) {
+            return Double.NaN;
+        }
+        double dot = length < 1.0E-6
+                ? 0.0
+                : (dir.xCoord * look.xCoord + dir.yCoord * look.yCoord + dir.zCoord * look.zCoord) / length;
+        if (dot <= 0.0) {
+            // За камерой: горизонтальные грани оцениваем по горизонтальному взгляду,
+            // чтобы можно было ставить "под себя" при взгляде вниз.
+            double lookHorizontal = Math.sqrt(look.xCoord * look.xCoord + look.zCoord * look.zCoord);
+            if (facing.getFrontOffsetY() == 0 && lookHorizontal > 1.0E-4) {
+                double dotHorizontal = (dir.xCoord * look.xCoord + dir.zCoord * look.zCoord) / (length * lookHorizontal);
+                if (dotHorizontal > 0.0) {
+                    dot = dotHorizontal * 0.5;
+                }
             }
         }
-        return best;
-    }
-
-    private static final class FaceChoice {
-        private final EnumFacing facing;
-        private final double score;
-
-        private FaceChoice(EnumFacing facing, double score) {
-            this.facing = facing;
-            this.score = score;
+        // Грань перед камерой сильно приоритетнее грани за спиной.
+        double score = dot * 4.0 + (dot > 0.0 ? 6.0 : -6.0);
+        if (this.isFaceVisible(eye, support, facing, dir, reach)) {
+            score += 10.0;
         }
+        return score;
     }
 
     /**
@@ -262,22 +246,76 @@ public class Scaffold extends Module {
                 && mop.sideHit == facing;
     }
 
+    /**
+     * Куда чит ставит блок.
+     *
+     * Идём по направлению реального движения (если стоим - по взгляду камеры)
+     * и берём ПЕРВУЮ пустую клетку на уровне моста после сплошных блоков.
+     * Это всегда клетка ПЕРЕД игроком по ходу движения и всегда вплотную
+     * к опоре, поэтому мост получается ровный и не шириной в 2 блока.
+     *
+     * place-ahead задаёт, насколько далеко вперёд вообще смотреть (в тиках),
+     * а не ставить блок в случайную клетку рядом.
+     */
     private BlockPos getTargetPos() {
-        double ahead = (double) this.placeAhead.getValue();
-        double predictedX = mc.thePlayer.posX + mc.thePlayer.motionX * ahead;
-        double predictedZ = mc.thePlayer.posZ + mc.thePlayer.motionZ * ahead;
-        int startY = MathHelper.floor_double(mc.thePlayer.posY);
-        return new BlockPos(
-                MathHelper.floor_double(predictedX),
-                (this.stage != 0 && !this.shouldKeepY ? Math.min(startY, this.startY) : startY) - 1,
-                MathHelper.floor_double(predictedZ)
-        );
+        double motionX = mc.thePlayer.motionX;
+        double motionZ = mc.thePlayer.motionZ;
+        double speed = Math.sqrt(motionX * motionX + motionZ * motionZ);
+        double dirX;
+        double dirZ;
+        if (speed > 0.01) {
+            dirX = motionX / speed;
+            dirZ = motionZ / speed;
+        } else {
+            double radians = Math.toRadians((double) this.getPlayerYaw());
+            dirX = -Math.sin(radians);
+            dirZ = Math.cos(radians);
+        }
+        // Уровень моста: на земле - блок под ногами, в воздухе - уровень, с которого прыгнули
+        // (startY обновляется только на земле), поэтому в прыжке не строится ступенька вверх.
+        int feetLevel = mc.thePlayer.onGround
+                ? MathHelper.floor_double(mc.thePlayer.posY)
+                : this.startY;
+        if (feetLevel > 255 || Math.abs(feetLevel - MathHelper.floor_double(mc.thePlayer.posY)) > 6) {
+            feetLevel = MathHelper.floor_double(mc.thePlayer.posY);
+        }
+        int targetY = feetLevel - 1;
+        int maxCells = speed > 0.01
+                ? Math.max(2, Math.min(10, this.placeAhead.getValue() / 2 + 1))
+                : 2;
+        int cellX = MathHelper.floor_double(mc.thePlayer.posX);
+        int cellZ = MathHelper.floor_double(mc.thePlayer.posZ);
+        double accumX = 0.0;
+        double accumZ = 0.0;
+        BlockPos last = null;
+        for (int i = 0; i < maxCells; i++) {
+            // Шаг только по одной оси: путь всегда 4-связный (диагональ - лесенкой),
+            // поэтому каждая следующая клетка имеет общую грань с предыдущей.
+            accumX += Math.abs(dirX);
+            accumZ += Math.abs(dirZ);
+            if (accumX >= accumZ) {
+                accumX -= 1.0;
+                cellX += dirX >= 0.0 ? 1 : -1;
+            } else {
+                accumZ -= 1.0;
+                cellZ += dirZ >= 0.0 ? 1 : -1;
+            }
+            BlockPos cell = new BlockPos(cellX, targetY, cellZ);
+            if (BlockUtil.isReplaceable(cell) && !BlockUtil.isInteractable(cell)) {
+                return cell;
+            }
+            last = cell;
+        }
+        // Дальше всё занято - ставить рядом нечего (findBlockData вернёт null).
+        return last == null
+                ? new BlockPos(cellX, targetY, cellZ)
+                : last;
     }
 
     private BlockData getBlockData() {
         BlockPos targetPos = this.getTargetPos();
         if (this.stableBlockData != null
-                && this.stableBlockDataAge < 5
+                && this.stableBlockDataAge < 3
                 && this.isBlockDataValid(this.stableBlockData, targetPos)) {
             this.stableBlockDataAge++;
             return this.stableBlockData;
@@ -300,79 +338,94 @@ public class Scaffold extends Module {
         if (!this.isPlacementAllowed(placed)) {
             return false;
         }
+        if (this.intersectsPlayer(placed)) {
+            return false;
+        }
         double reach = (double) mc.playerController.getBlockReachDistance() + 0.5;
         if (mc.thePlayer.getDistance(
                 (double) support.getX() + 0.5, (double) support.getY() + 0.5, (double) support.getZ() + 0.5
         ) > reach) {
             return false;
         }
+        // Кэш не должен "уезжать" от предсказанной колонки: иначе мост шириной в 2 блока.
         if (placed.distanceSqToCenter(
                 (double) targetPos.getX() + 0.5, (double) targetPos.getY() + 0.5, (double) targetPos.getZ() + 0.5
-        ) > 9.0) {
+        ) > 6.0) {
             return false;
         }
         return this.stage == 0 || this.shouldKeepY || support.getY() < this.startY;
     }
 
+    /**
+     * Ищет ОПОРУ и ГРАНЬ так, чтобы блок встал именно в предсказанную колонку
+     * (targetPos), а не в ближайшую соседнюю клетку. Из-за старого поиска
+     * "любая опора рядом с целью" и получался мост шириной в 2 блока.
+     */
     private BlockData findBlockData(BlockPos targetPos) {
         if (!BlockUtil.isReplaceable(targetPos)) {
             return null;
-        } else {
-            ArrayList<BlockPos> positions = new ArrayList<>();
-            for (int x = -4; x <= 4; x++) {
-                for (int y = -4; y <= 0; y++) {
-                    for (int z = -4; z <= 4; z++) {
-                        BlockPos pos = targetPos.add(x, y, z);
-                        if (!BlockUtil.isReplaceable(pos)
-                                && !BlockUtil.isInteractable(pos)
-                                && !(
-                                mc.thePlayer.getDistance((double) pos.getX() + 0.5, (double) pos.getY() + 0.5, (double) pos.getZ() + 0.5)
-                                        > (double) mc.playerController.getBlockReachDistance()
-                        )
-                                && (this.stage == 0 || this.shouldKeepY || pos.getY() < this.startY)) {
-                            for (EnumFacing facing : EnumFacing.VALUES) {
-                                if (facing != EnumFacing.DOWN) {
-                                    BlockPos blockPos = pos.offset(facing);
-                                    if (BlockUtil.isReplaceable(blockPos) && this.isPlacementAllowed(blockPos)) {
-                                        positions.add(pos);
-                                    }
-                                }
-                            }
+        }
+        Vec3 eye = this.getPredictedEyes();
+        Vec3 look = RotationUtil.getLookVec(this.getPlayerYaw(), this.getPlayerPitch());
+        double reach = (double) mc.playerController.getBlockReachDistance();
+        double tx = (double) targetPos.getX() + 0.5;
+        double ty = (double) targetPos.getY() + 0.5;
+        double tz = (double) targetPos.getZ() + 0.5;
+        BlockData best = null;
+        double bestScore = -Double.MAX_VALUE;
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dz = -2; dz <= 2; dz++) {
+                for (int dy = -2; dy <= 0; dy++) {
+                    BlockPos placed = targetPos.add(dx, dy, dz);
+                    if (!BlockUtil.isReplaceable(placed) || BlockUtil.isInteractable(placed)) {
+                        continue;
+                    }
+                    if (!this.isPlacementAllowed(placed)) {
+                        continue;
+                    }
+                    if (this.intersectsPlayer(placed)) {
+                        continue;
+                    }
+                    double distance = placed.distanceSqToCenter(tx, ty, tz);
+                    // Ставим только рядом с предсказанной колонкой.
+                    if (distance > 6.0) {
+                        continue;
+                    }
+                    for (EnumFacing facing : EnumFacing.VALUES) {
+                        // Клик по нижней грани опоры сверху не используем.
+                        if (facing == EnumFacing.DOWN) {
+                            continue;
+                        }
+                        BlockPos support = placed.offset(facing.getOpposite());
+                        if (BlockUtil.isReplaceable(support) || BlockUtil.isInteractable(support)) {
+                            continue;
+                        }
+                        if (mc.thePlayer.getDistance(
+                                (double) support.getX() + 0.5, (double) support.getY() + 0.5, (double) support.getZ() + 0.5
+                        ) > reach + 0.5) {
+                            continue;
+                        }
+                        if (this.stage != 0 && !this.shouldKeepY && support.getY() >= this.startY) {
+                            continue;
+                        }
+                        double faceScore = this.scoreFace(support, facing, eye, look, reach);
+                        if (Double.isNaN(faceScore)) {
+                            continue;
+                        }
+                        // Блок ровно в цели - главный приоритет, расстояние до цели -
+                        // следующий по важности фактор. Грань решает только внешний вид/удобство.
+                        double score = faceScore
+                                + (placed.equals(targetPos) ? 100.0 : 0.0)
+                                - distance * 25.0;
+                        if (best == null || score > bestScore) {
+                            bestScore = score;
+                            best = new BlockData(support, facing);
                         }
                     }
                 }
             }
-            if (positions.isEmpty()) {
-                return null;
-            } else {
-                positions.sort(
-                        Comparator.comparingDouble(
-                                o -> o.distanceSqToCenter((double) targetPos.getX() + 0.5, (double) targetPos.getY() + 0.5, (double) targetPos.getZ() + 0.5)
-                        )
-                );
-                // Смотрим не только на ближайшую опору: если у неё все грани за камерой,
-                // берём следующую. Иначе предсказанная грань оказывалась позади игрока.
-                int limit = Math.min(positions.size(), 8);
-                BlockData best = null;
-                double bestScore = -Double.MAX_VALUE;
-                for (int i = 0; i < limit; i++) {
-                    BlockPos support = positions.get(i);
-                    FaceChoice choice = this.pickBestFace(support, targetPos);
-                    if (choice == null) {
-                        continue;
-                    }
-                    double distance = support.distanceSqToCenter(
-                            (double) targetPos.getX() + 0.5, (double) targetPos.getY() + 0.5, (double) targetPos.getZ() + 0.5
-                    );
-                    double score = choice.score - distance * 0.5;
-                    if (best == null || score > bestScore) {
-                        bestScore = score;
-                        best = new BlockData(support, choice.facing);
-                    }
-                }
-                return best;
-            }
         }
+        return best;
     }
 
     private void place(BlockPos blockPos, EnumFacing enumFacing, Vec3 vec3) {
