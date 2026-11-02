@@ -147,14 +147,18 @@ public class Scaffold extends Module {
     }
 
     /**
-     * Блок ставится на уровень ног или выше (то есть "под себя, чтобы подняться")
-     * только если под ногами реально есть зазор. Стоя на земле без зазора такие
-     * цели не рассматриваются - чит не крутит голову вниз впустую.
-     * Прыжок самого скаффолда (tower/telly/keep-y) считается всегда: иначе keepY ломается.
+     * Правило постановки: блок никогда не ставится выше ног.
+     * Ниже ног - обычный мост, можно всегда.
+     * Ровно на уровне ног ("под себя, чтобы подняться") - только если под ногами
+     * реально есть зазор или это прыжок самого скаффолда (tower/telly/keep-y).
      */
     private boolean isPlacementAllowed(BlockPos placed) {
-        if (placed.getY() < MathHelper.floor_double(mc.thePlayer.posY)) {
+        int feetY = MathHelper.floor_double(mc.thePlayer.posY);
+        if (placed.getY() < feetY) {
             return true;
+        }
+        if (placed.getY() > feetY) {
+            return false;
         }
         return this.hasGapBelow() || this.isScaffoldJump();
     }
@@ -175,18 +179,23 @@ public class Scaffold extends Module {
         return this.towering || this.isTowering() || this.stage > 0 || this.keepY.getValue() != 0;
     }
 
+    /**
+     * Предсказывает грань, в которую нужно ставить блок.
+     * Приоритет: грань, которую реально видно из предсказанных глаз,
+     * затем - грань, в которую игрок уже смотрит (чтобы голова не дёргалась
+     * между несколькими равными кандидатами).
+     */
     private EnumFacing getBestFacing(BlockPos blockPos1, BlockPos blockPos3) {
-        Vec3 eye = mc.thePlayer.getPositionEyes(1.0F);
+        Vec3 eye = this.getPredictedEyes();
         Vec3 look = RotationUtil.getLookVec(mc.thePlayer.rotationYaw, mc.thePlayer.rotationPitch);
-        double offset = 0.0;
+        double reach = (double) mc.playerController.getBlockReachDistance();
+        double offset = -Double.MAX_VALUE;
         EnumFacing enumFacing = null;
         for (EnumFacing facing : EnumFacing.VALUES) {
             if (facing != EnumFacing.DOWN) {
                 BlockPos pos = blockPos1.offset(facing);
                 if (pos.getY() <= blockPos3.getY() && this.isPlacementAllowed(pos)) {
                     double distance = pos.distanceSqToCenter((double) blockPos3.getX() + 0.5, (double) blockPos3.getY() + 0.5, (double) blockPos3.getZ() + 0.5);
-                    // Приоритет - грань, в которую игрок уже смотрит: иначе при нескольких
-                    // равных кандидатах голова дёргается между гранями каждый тик.
                     Vec3 center = new Vec3(
                             (double) blockPos1.getX() + 0.5 + (double) facing.getFrontOffsetX() * 0.5,
                             (double) blockPos1.getY() + 0.5 + (double) facing.getFrontOffsetY() * 0.5,
@@ -196,6 +205,9 @@ public class Scaffold extends Module {
                     double length = dir.lengthVector();
                     double dot = length < 1.0E-6 ? 0.0 : (dir.xCoord * look.xCoord + dir.yCoord * look.yCoord + dir.zCoord * look.zCoord) / length;
                     double score = dot * 4.0 - distance;
+                    if (this.isFaceVisible(eye, blockPos1, facing, dir, reach)) {
+                        score += 10.0;
+                    }
                     if (enumFacing == null || score > offset || score == offset && facing == EnumFacing.UP) {
                         offset = score;
                         enumFacing = facing;
@@ -204,6 +216,17 @@ public class Scaffold extends Module {
             }
         }
         return enumFacing;
+    }
+
+    private boolean isFaceVisible(Vec3 eye, BlockPos pos, EnumFacing facing, Vec3 dir, double reach) {
+        float[] rotations = RotationUtil.getRotationsToRaw(
+                dir.xCoord, dir.yCoord, dir.zCoord, mc.thePlayer.rotationYaw, mc.thePlayer.rotationPitch
+        );
+        MovingObjectPosition mop = RotationUtil.rayTraceFrom(eye, rotations[0], rotations[1], reach);
+        return mop != null
+                && mop.typeOfHit == MovingObjectType.BLOCK
+                && mop.getBlockPos().equals(pos)
+                && mop.sideHit == facing;
     }
 
     private BlockPos getTargetPos() {
@@ -620,25 +643,31 @@ public class Scaffold extends Module {
         Vec3 eye = mc.thePlayer.getPositionEyes(1.0F);
         Vec3 look = RotationUtil.getLookVec(yaw, pitch);
         MovingObjectPosition mop = RotationUtil.rayTraceFrom(eye, yaw, pitch, reach);
-        boolean hit = mop != null && mop.typeOfHit == MovingObjectType.BLOCK;
-        BlockPos support = hit ? mop.getBlockPos() : target.blockPos();
-        EnumFacing side = hit ? mop.sideHit : target.facing();
+        // Дебаг всегда показывает ПРЕДСКАЗАННУЮ грань, а не то, куда случайно попал луч.
+        BlockPos support = target.blockPos();
+        EnumFacing side = target.facing();
         BlockPos placePos = support.offset(side);
         this.debugEye = eye;
-        this.debugHit = hit
+        this.debugHit = mop != null && mop.typeOfHit == MovingObjectType.BLOCK
                 ? mop.hitVec
                 : eye.addVector(look.xCoord * reach, look.yCoord * reach, look.zCoord * reach);
         this.debugSupport = support;
         this.debugSide = side;
         this.debugPlacePos = placePos;
-        this.debugTarget = target.blockPos();
+        this.debugTarget = support;
         this.debugValid = false;
         if (!ItemUtil.isHoldingBlock() || this.blockCount <= 0) {
             this.debugReason = "no block in hand";
             return;
         }
-        if (!hit) {
-            this.debugReason = "ray missed";
+        if (mop == null || mop.typeOfHit != MovingObjectType.BLOCK) {
+            this.debugReason = "true-sight: ray missed";
+            return;
+        }
+        // Ставим только в предсказанную грань. Любая другая грань/блок = клик в пустоту,
+        // из-за которого и появлялась задержка постановки.
+        if (!mop.getBlockPos().equals(support) || mop.sideHit != side) {
+            this.debugReason = "true-sight: other face";
             return;
         }
         if (!BlockUtil.isReplaceable(placePos) || BlockUtil.isInteractable(placePos)) {
@@ -649,8 +678,8 @@ public class Scaffold extends Module {
             this.debugReason = "place pos inside player";
             return;
         }
-        if (placePos.getY() > MathHelper.floor_double(mc.thePlayer.posY) - 1) {
-            this.debugReason = "place pos above feet";
+        if (!this.isPlacementAllowed(placePos)) {
+            this.debugReason = "place pos not allowed";
             return;
         }
         BlockPos targetPos = this.getTargetPos();
