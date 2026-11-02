@@ -803,6 +803,18 @@ public class Scaffold extends Module {
             this.debugReason = "place pos too far from target";
             return;
         }
+        // Если ротация выключена, модуль не должен вращать игрока, поэтому ставить
+        // можно только туда, куда игрок реально смотрит (как в ванили). Иначе блоки
+        // ставились бы на грани, которые не под прицелом ("тру сайд разрешает
+        // поставить туда, куда в ваниле не поставится").
+        if (this.rotationMode.getValue() == 0) {
+            if (mop == null || mop.typeOfHit != MovingObjectType.BLOCK
+                    || !mop.getBlockPos().equals(support)
+                    || mop.sideHit != side) {
+                this.debugReason = "not looking at face";
+                return;
+            }
+        }
         Vec3 hit;
         if (this.trueSight.getValue()) {
             // Граница видна из предсказанных глаз (PRE-рейкаст) - иначе не ставим.
