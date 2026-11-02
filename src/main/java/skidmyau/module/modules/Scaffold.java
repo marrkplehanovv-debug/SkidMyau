@@ -57,7 +57,6 @@ public class Scaffold extends Module {
     private int startY = 256;
     private boolean shouldKeepY = false;
     private boolean towering = false;
-    private EnumFacing targetFacing = null;
     private BlockData pendingBlockData = null;
     private Vec3 pendingHitVec = null;
     private boolean placedThisTick = false;
@@ -176,14 +175,35 @@ public class Scaffold extends Module {
     }
 
     /**
+     * Идёт реальный подъём (tower/telly): блок надо ставить ПОД ноги на текущей
+     * высоте, иначе башня не растёт.
+     *
+     * keep-y сюда НЕ входит: он как раз должен держать один и тот же уровень,
+     * даже когда игрок прыгает.
+     */
+    private boolean isTowerAscending() {
+        int towerMode = this.tower.getValue();
+        if (towerMode == 3) {
+            return mc.gameSettings.keyBindJump.isKeyDown() || this.towering;
+        }
+        if (towerMode != 0) {
+            // VANILLA/EXTRA: цикл прыжка уже запущен в onStrafe.
+            return this.towerTick > 0;
+        }
+        // keep-y TELLY тоже поднимает вверх.
+        return this.keepY.getValue() == 3 && this.stage > 0;
+    }
+
+    /**
      * Прыжок, который делает сам скаффолд (tower/telly/keep-y) прямо сейчас.
      * Это НЕ просто включённая настройка: иначе клиент считает прыжком игрока
      * любой тик и выбирает грань на уровень выше.
      */
     private boolean isScaffoldJump() {
-        return this.towering
+        return this.isTowerAscending()
+                || this.towering
                 || this.isTowering()
-                || (this.stage > 0 && this.keepY.getValue() != 0);
+                || (this.keepY.getValue() != 0 && this.stage > 0 && !mc.thePlayer.onGround);
     }
 
     /**
@@ -258,20 +278,23 @@ public class Scaffold extends Module {
     /**
      * Уровень ног для моста.
      *
-     * На земле - текущие ноги. В воздухе, когда игрок просто падает/летит по
-     * инерции, берём уровень последнего наземного тика (startY), иначе в прыжке
-     * мост уезжал бы на блок выше.
+     * Обычный мост и keep-y всегда держат уровень последнего наземного тика
+     * (startY), даже если игрок прыгнул. Иначе в прыжке блок уезжал на уровень
+     * выше, и keep-y "поднимал" мост вместо того, чтобы держать высоту.
      *
-     * Но когда это реальный прыжок (свой или скаффолда) - берём текущие ноги,
-     * чтобы можно было поставить блок ПОД себя и подняться.
+     * Только реальный подъём (tower/telly) берёт текущие ноги, чтобы блок
+     * ставился ПОД игрока и можно было подниматься.
      */
     private int getTargetFeetLevel() {
         int floor = MathHelper.floor_double(mc.thePlayer.posY);
-        if (this.isScaffoldJump() || this.isPlayerJump()) {
+        // Свой прыжок и подъём башни ставят блок прямо под ноги, чтобы подняться.
+        // В остальном в воздухе держим уровень последнего наземного тика (startY),
+        // чтобы мост не уезжал ни вверх при прыжке, ни вниз при падении (keep-y).
+        if (this.isTowerAscending() || this.isPlayerJump()) {
             return floor;
         }
         int level = mc.thePlayer.onGround ? floor : this.startY;
-        if (level > 255 || Math.abs(level - floor) > 6) {
+        if (level > 255 || floor - level > 6) {
             level = floor;
         }
         return level;
@@ -280,71 +303,66 @@ public class Scaffold extends Module {
     /**
      * Куда чит ставит блок.
      *
-     * Идём по направлению реального движения (если стоим - по взгляду камеры)
-     * и берём ПЕРВУЮ пустую клетку на уровне моста после сплошных блоков.
-     * Это всегда клетка ПЕРЕД игроком по ходу движения и всегда вплотную
-     * к опоре, поэтому мост получается ровный и не шириной в 2 блока.
+     * Базовая цель - клетка ПОД игроком на уровне моста: туда игрок наступит
+     * или туда упадёт. Это даёт ровный мост в одну клетку и не оставляет
+     * "взлётной полосы" из лишних блоков впереди.
      *
-     * place-ahead задаёт, насколько далеко вперёд вообще смотреть (в тиках),
-     * а не ставить блок в случайную клетку рядом.
+     * Если под игроком уже стоит блок, разрешаем поставить РОВНО ОДНУ клетку
+     * впереди и только когда игрок прошёл середину своей клетки в сторону
+     * движения. Так блок появляется заранее, но мост не убегает вперёд.
+     *
+     * place-ahead оставлен как запас дальности: им ограничивается, насколько
+     * далеко вперёд вообще разрешено смотреть.
      */
     private BlockPos getTargetPos() {
+        int targetY = this.getTargetFeetLevel() - 1;
+        int cellX = MathHelper.floor_double(mc.thePlayer.posX);
+        int cellZ = MathHelper.floor_double(mc.thePlayer.posZ);
+        // Клетка под игроком - главный приоритет (tower/keep-y/край/падение).
         double motionX = mc.thePlayer.motionX;
         double motionZ = mc.thePlayer.motionZ;
         double speed = Math.sqrt(motionX * motionX + motionZ * motionZ);
-        double dirX;
-        double dirZ;
-        if (speed > 0.01) {
-            dirX = motionX / speed;
-            dirZ = motionZ / speed;
-        } else {
-            double radians = Math.toRadians((double) this.getPlayerYaw());
-            dirX = -Math.sin(radians);
-            dirZ = Math.cos(radians);
+        // Стоим на месте и не прыгаем - не ставим блок в никуда (лишняя постановка).
+        // Прыжок игрока/башни - исключение: блок нужен прямо под ногами для подъёма.
+        if (speed <= 0.05 && !this.isPlayerJump() && !this.isTowerAscending()) {
+            return null;
         }
-        int targetY = this.getTargetFeetLevel() - 1;
-        int maxCells = speed > 0.01
-                ? Math.max(2, Math.min(10, this.placeAhead.getValue() / 2 + 1))
-                : 2;
-        int cellX = MathHelper.floor_double(mc.thePlayer.posX);
-        int cellZ = MathHelper.floor_double(mc.thePlayer.posZ);
-        // Сначала пробуем клетку ПОД игроком: если опоры под ногами нет
-        // (tower/keep-y/падение/край), блок надо ставить туда, а не вперёд.
         BlockPos ownCell = new BlockPos(cellX, targetY, cellZ);
-        if (BlockUtil.isReplaceable(ownCell)
-                && !BlockUtil.isInteractable(ownCell)
-                && !this.intersectsPlayer(ownCell)) {
+        if (this.isPlaceableTarget(ownCell)) {
             return ownCell;
         }
-        double accumX = 0.0;
-        double accumZ = 0.0;
-        BlockPos last = null;
-        for (int i = 0; i < maxCells; i++) {
-            // Шаг только по одной оси: путь всегда 4-связный (диагональ - лесенкой),
-            // поэтому каждая следующая клетка имеет общую грань с предыдущей.
-            accumX += Math.abs(dirX);
-            accumZ += Math.abs(dirZ);
-            if (accumX >= accumZ) {
-                accumX -= 1.0;
-                cellX += dirX >= 0.0 ? 1 : -1;
-            } else {
-                accumZ -= 1.0;
-                cellZ += dirZ >= 0.0 ? 1 : -1;
+        // Пред-постановка одной клетки впереди: только когда игрок уже прошёл
+        // середину текущей клетки по ведущей оси движения.
+        if (Math.abs(motionX) >= Math.abs(motionZ)) {
+            double local = mc.thePlayer.posX - (double) cellX;
+            if (motionX >= 0.0 ? local < 0.5 : local > 0.5) {
+                return null;
             }
-            BlockPos cell = new BlockPos(cellX, targetY, cellZ);
-            if (BlockUtil.isReplaceable(cell) && !BlockUtil.isInteractable(cell)) {
-                return cell;
+            cellX += motionX >= 0.0 ? 1 : -1;
+        } else {
+            double local = mc.thePlayer.posZ - (double) cellZ;
+            if (motionZ >= 0.0 ? local < 0.5 : local > 0.5) {
+                return null;
             }
-            last = cell;
+            cellZ += motionZ >= 0.0 ? 1 : -1;
         }
-        // Дальше всё занято - ставить рядом нечего (findBlockData вернёт null).
-        return last == null
-                ? new BlockPos(cellX, targetY, cellZ)
-                : last;
+        BlockPos nextCell = new BlockPos(cellX, targetY, cellZ);
+        return this.isPlaceableTarget(nextCell) ? nextCell : null;
+    }
+
+    private boolean isPlaceableTarget(BlockPos pos) {
+        return BlockUtil.isReplaceable(pos)
+                && !BlockUtil.isInteractable(pos)
+                && !this.intersectsPlayer(pos);
     }
 
     private BlockData getBlockData() {
         BlockPos targetPos = this.getTargetPos();
+        if (targetPos == null) {
+            this.stableBlockData = null;
+            this.stableBlockDataAge = 0;
+            return null;
+        }
         if (this.stableBlockData != null
                 && this.stableBlockDataAge < 3
                 && this.isBlockDataValid(this.stableBlockData, targetPos)) {
@@ -363,6 +381,10 @@ public class Scaffold extends Module {
             return false;
         }
         BlockPos placed = support.offset(blockData.facing());
+        // Ставим только в предсказанную клетку. Любая другая - лишний блок.
+        if (!placed.equals(targetPos)) {
+            return false;
+        }
         if (!BlockUtil.isReplaceable(placed)) {
             return false;
         }
@@ -378,85 +400,54 @@ public class Scaffold extends Module {
         ) > reach) {
             return false;
         }
-        // Кэш не должен "уезжать" от предсказанной колонки: иначе мост шириной в 2 блока.
-        if (placed.distanceSqToCenter(
-                (double) targetPos.getX() + 0.5, (double) targetPos.getY() + 0.5, (double) targetPos.getZ() + 0.5
-        ) > 6.0) {
-            return false;
-        }
         return this.stage == 0 || this.shouldKeepY || support.getY() < this.startY;
     }
 
     /**
-     * Ищет ОПОРУ и ГРАНЬ так, чтобы блок встал именно в предсказанную колонку
-     * (targetPos), а не в ближайшую соседнюю клетку. Из-за старого поиска
-     * "любая опора рядом с целью" и получался мост шириной в 2 блока.
+     * Ищет ОПОРУ и ГРАНЬ для РОВНО ОДНОЙ предсказанной клетки (targetPos).
+     * Никаких соседних клеток: из-за старого поиска "любая опора рядом"
+     * и появлялись лишние блоки / мост шириной в 2 блока.
      */
     private BlockData findBlockData(BlockPos targetPos) {
-        if (!BlockUtil.isReplaceable(targetPos)) {
+        if (targetPos == null
+                || !BlockUtil.isReplaceable(targetPos)
+                || BlockUtil.isInteractable(targetPos)
+                || !this.isPlacementAllowed(targetPos)
+                || this.intersectsPlayer(targetPos)) {
             return null;
         }
         Vec3 eye = this.getPredictedEyes();
         Vec3 look = RotationUtil.getLookVec(this.getPlayerYaw(), this.getPlayerPitch());
         double reach = (double) mc.playerController.getBlockReachDistance();
-        double tx = (double) targetPos.getX() + 0.5;
-        double ty = (double) targetPos.getY() + 0.5;
-        double tz = (double) targetPos.getZ() + 0.5;
         BlockData best = null;
         double bestScore = -Double.MAX_VALUE;
-        for (int dx = -2; dx <= 2; dx++) {
-            for (int dz = -2; dz <= 2; dz++) {
-                for (int dy = -2; dy <= 0; dy++) {
-                    BlockPos placed = targetPos.add(dx, dy, dz);
-                    if (!BlockUtil.isReplaceable(placed) || BlockUtil.isInteractable(placed)) {
-                        continue;
-                    }
-                    if (!this.isPlacementAllowed(placed)) {
-                        continue;
-                    }
-                    if (this.intersectsPlayer(placed)) {
-                        continue;
-                    }
-                    double distance = placed.distanceSqToCenter(tx, ty, tz);
-                    // Ставим только рядом с предсказанной колонкой.
-                    if (distance > 6.0) {
-                        continue;
-                    }
-                    for (EnumFacing facing : EnumFacing.VALUES) {
-                        // Клик по нижней грани опоры сверху не используем.
-                        if (facing == EnumFacing.DOWN) {
-                            continue;
-                        }
-                        BlockPos support = placed.offset(facing.getOpposite());
-                        if (BlockUtil.isReplaceable(support) || BlockUtil.isInteractable(support)) {
-                            continue;
-                        }
-                        if (mc.thePlayer.getDistance(
-                                (double) support.getX() + 0.5, (double) support.getY() + 0.5, (double) support.getZ() + 0.5
-                        ) > reach + 0.5) {
-                            continue;
-                        }
-                        if (this.stage != 0 && !this.shouldKeepY && support.getY() >= this.startY) {
-                            continue;
-                        }
-                        double faceScore = this.scoreFace(
-                                support, facing, eye, look, reach,
-                                this.isFaceVisible(eye, support, facing, faceCenter(support, facing).subtract(eye), reach)
-                        );
-                        if (Double.isNaN(faceScore)) {
-                            continue;
-                        }
-                        // Блок ровно в цели - главный приоритет, расстояние до цели -
-                        // следующий по важности фактор. Грань решает только внешний вид/удобство.
-                        double score = faceScore
-                                + (placed.equals(targetPos) ? 100.0 : 0.0)
-                                - distance * 25.0;
-                        if (best == null || score > bestScore) {
-                            bestScore = score;
-                            best = new BlockData(support, facing);
-                        }
-                    }
-                }
+        for (EnumFacing facing : EnumFacing.VALUES) {
+            // Клик по нижней грани опоры сверху не используем.
+            if (facing == EnumFacing.DOWN) {
+                continue;
+            }
+            BlockPos support = targetPos.offset(facing.getOpposite());
+            if (BlockUtil.isReplaceable(support) || BlockUtil.isInteractable(support)) {
+                continue;
+            }
+            if (mc.thePlayer.getDistance(
+                    (double) support.getX() + 0.5, (double) support.getY() + 0.5, (double) support.getZ() + 0.5
+            ) > reach + 0.5) {
+                continue;
+            }
+            if (this.stage != 0 && !this.shouldKeepY && support.getY() >= this.startY) {
+                continue;
+            }
+            double faceScore = this.scoreFace(
+                    support, facing, eye, look, reach,
+                    this.isFaceVisible(eye, support, facing, faceCenter(support, facing).subtract(eye), reach)
+            );
+            if (Double.isNaN(faceScore)) {
+                continue;
+            }
+            if (best == null || faceScore > bestScore) {
+                bestScore = faceScore;
+                best = new BlockData(support, facing);
             }
         }
         return best;
@@ -684,13 +675,7 @@ public class Scaffold extends Module {
                 this.yaw = desiredYaw;
                 this.pitch = desiredPitch;
                 BlockData blockData = this.getBlockData();
-                if (this.targetFacing != null) {
-                    int playerBlockX = MathHelper.floor_double(mc.thePlayer.posX);
-                    int playerBlockY = MathHelper.floor_double(mc.thePlayer.posY);
-                    int playerBlockZ = MathHelper.floor_double(mc.thePlayer.posZ);
-                    blockData = new BlockData(new BlockPos(playerBlockX, playerBlockY - 1, playerBlockZ), this.targetFacing);
-                    this.targetFacing = null;
-                } else if (this.keepY.getValue() == 2 && this.stage > 0 && !mc.thePlayer.onGround) {
+                if (this.keepY.getValue() == 2 && this.stage > 0 && !mc.thePlayer.onGround) {
                     int nextBlockY = MathHelper.floor_double(mc.thePlayer.posY + mc.thePlayer.motionY);
                     if (nextBlockY <= this.startY && mc.thePlayer.posY > (double) (this.startY + 1)) {
                         this.shouldKeepY = true;
@@ -820,16 +805,15 @@ public class Scaffold extends Module {
         }
         Vec3 hit;
         if (this.trueSight.getValue()) {
+            // Граница видна из предсказанных глаз (PRE-рейкаст) - иначе не ставим.
             if (aimHit == null) {
                 this.debugReason = "true-sight: face not visible";
                 return;
             }
-            hit = aimHit;
-        } else {
-            hit = mop != null && mop.typeOfHit == MovingObjectType.BLOCK
-                    ? mop.hitVec
-                    : BlockUtil.getHitVec(support, side, yaw, pitch);
         }
+        // Вектор попадания пакета считаем от текущих глаз и отправляемой ротации -
+        // иначе RotationPlace/AimModulo360 фиксирует несоответствие ротации и вектора.
+        hit = BlockUtil.getHitVec(support, side, yaw, pitch);
         if (hit == null) {
             this.debugReason = "no hit vec";
             return;
@@ -1316,7 +1300,6 @@ public class Scaffold extends Module {
                                             }
                                         } else {
                                             this.towerTick = 2;
-                                            this.targetFacing = facing;
                                             mc.thePlayer.motionY = 0.42F;
                                         }
                                         return;
