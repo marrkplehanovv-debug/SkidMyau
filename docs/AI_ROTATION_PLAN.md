@@ -993,6 +993,9 @@ liquidbounce-src/src/main/kotlin/net/ccbluex/liquidbounce/
       NORMAL/BUTTERFLY/DOUBLE/DRAG;
 - [x] модуль `AI` (`AiRotation`): свойства, ленивая загрузка моделей,
       JSONL-рекордер (§4.2), `notifyClick`/`noteIdle`;
+- [x] модуль `AITrainer`: спавн клиентских слизней / подсветка грани блока,
+      цикл «цель → прицел → клик → следующая», авто-включение записи,
+      счётчик семплов в чате и в суффиксе модуля;
 - [x] `Scaffold`: `rotations=AI` + смещение точки на грани с raycast-валидацией
       и fallback в центр; старые режимы 0..3 не тронуты;
 - [x] `KillAura`: `rotations=AI` + fallback на старый `RotationUtil`;

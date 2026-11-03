@@ -44,6 +44,7 @@ public class ClickGui extends GuiScreen {
         combatModules.add(SkidMyau.moduleManager.getModule(Refill.class));
         combatModules.add(SkidMyau.moduleManager.getModule(HitSelect.class));
         combatModules.add(SkidMyau.moduleManager.getModule(AiRotation.class));
+        combatModules.add(SkidMyau.moduleManager.getModule(AiTrainer.class));
 
         List<Module> movementModules = new ArrayList<>();
         movementModules.add(SkidMyau.moduleManager.getModule(AntiAFK.class));

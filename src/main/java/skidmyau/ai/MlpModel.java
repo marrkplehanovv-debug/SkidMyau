@@ -25,6 +25,8 @@ public final class MlpModel {
         public String name = "unknown";
         public int inputSize = 0;
         public int outputSize = 0;
+        /** Классификация датасета: ENTITY / BLOCK / SCAFFOLD / ALL. */
+        public String dataset = "ALL";
         public String[] features = new String[0];
         public float[] inputMean = new float[0];
         public float[] inputStd = new float[0];

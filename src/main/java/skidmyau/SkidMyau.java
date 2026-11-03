@@ -67,6 +67,7 @@ public class SkidMyau {
         moduleManager.modules.put(AntiVoid.class, new AntiVoid());
         moduleManager.modules.put(AutoClicker.class, new AutoClicker());
         moduleManager.modules.put(AiRotation.class, new AiRotation());
+        moduleManager.modules.put(AiTrainer.class, new AiTrainer());
         moduleManager.modules.put(AutoAnduril.class, new AutoAnduril());
         moduleManager.modules.put(AutoHeal.class, new AutoHeal());
         moduleManager.modules.put(AutoTool.class, new AutoTool());

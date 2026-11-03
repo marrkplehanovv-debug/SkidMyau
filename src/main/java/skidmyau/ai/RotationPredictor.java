@@ -91,7 +91,7 @@ public final class RotationPredictor {
         float totalYaw = MathHelper.wrapAngleTo180_float(target.yaw - currentYaw);
         float totalPitch = MathHelper.clamp_float(target.pitch - currentPitch, -90.0F, 90.0F);
 
-        MlpModel model = cfg.getAngleModel();
+        MlpModel model = cfg.getAngleModelForKind(target.kind);
         boolean usedModel = false;
         float deltaYaw;
         float deltaPitch;

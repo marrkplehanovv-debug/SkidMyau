@@ -3,6 +3,7 @@ package skidmyau.module.modules;
 import com.google.common.base.CaseFormat;
 import skidmyau.SkidMyau;
 import skidmyau.ai.AiTarget;
+import skidmyau.ai.ClickProcess;
 import skidmyau.ai.RotationPredictor;
 import skidmyau.enums.BlinkModules;
 import skidmyau.event.EventManager;
@@ -58,6 +59,7 @@ public class KillAura extends Module {
     private final TimerUtil timer = new TimerUtil();
     private AttackData target = null;
     private final RotationPredictor predictor = new RotationPredictor();
+    private final ClickProcess clickProcess = new ClickProcess();
     private final AiTarget aiTarget = new AiTarget();
     private int switchTick = 0;
     private boolean hitRegistered = false;
@@ -81,6 +83,13 @@ public class KillAura extends Module {
     public final IntProperty minCPS;
     public final IntProperty maxCPS;
     public final IntProperty switchDelay;
+    // Клик-симуляция (как в AutoClicker): режимы, рандомизация CPS, aim-гейт.
+    public final ModeProperty clickMode;
+    public final PercentProperty clickVariance;
+    public final PercentProperty clickMiss;
+    public final PercentProperty clickPause;
+    public final FloatProperty clickAimGate;
+    public final IntProperty clickReaction;
     public final ModeProperty rotations;
     public final ModeProperty moveFix;
     public final PercentProperty smoothing;
@@ -113,7 +122,11 @@ public class KillAura extends Module {
             } else if (this.attackDelayMS > 0L) {
                 return false;
             } else {
-                this.attackDelayMS = this.attackDelayMS + this.getAttackDelay();
+                if (this.clickMode.getValue() != 0) {
+                    this.attackDelayMS = this.attackDelayMS + (long) this.clickProcess.nextDelayMs();
+                } else {
+                    this.attackDelayMS = this.attackDelayMS + this.getAttackDelay();
+                }
                 mc.thePlayer.swingItem();
                 if ((this.rotations.getValue() != 0 || !this.isBoxInAttackRange(this.target.getBox()))
                         && RotationUtil.rayTrace(this.target.getBox(), yaw, pitch, this.attackRange.getValue()) == null) {
@@ -342,6 +355,13 @@ public class KillAura extends Module {
         this.fov = new IntProperty("fov", 360, 30, 360);
         this.minCPS = new IntProperty("min-aps", 14, 1, 20);
         this.maxCPS = new IntProperty("max-aps", 14, 1, 20);
+        // Клик-симуляция (как в AutoClicker): режимы, рандомизация CPS, aim-гейт.
+        this.clickMode = new ModeProperty("click-mode", 0, new String[]{"LEGACY", "NORMAL", "BUTTERFLY", "DOUBLE", "DRAG"});
+        this.clickVariance = new PercentProperty("click-variance", 25);
+        this.clickMiss = new PercentProperty("click-miss", 0);
+        this.clickPause = new PercentProperty("click-pause", 3);
+        this.clickAimGate = new FloatProperty("click-aim-gate", 6.0F, 0.0F, 20.0F);
+        this.clickReaction = new IntProperty("click-reaction", 2, 0, 8);
         this.switchDelay = new IntProperty("switch-delay", 150, 0, 1000);
         this.rotations = new ModeProperty("rotations", 2, new String[]{"NONE", "LEGIT", "SILENT", "LOCK_VIEW", "AI"});
         this.moveFix = new ModeProperty("move-fix", 1, new String[]{"NONE", "SILENT", "STRICT"});
@@ -434,6 +454,15 @@ public class KillAura extends Module {
                 this.blockTick = 0;
             }
             if (attack) {
+                // Клик-симуляция (как в AutoClicker): настройка режима CPS и состояние прицеливания.
+                if (this.clickMode.getValue() != 0) {
+                    this.clickProcess.configure(
+                            this.clickMode.getValue(),
+                            this.minCPS.getValue(), this.maxCPS.getValue(),
+                            this.clickVariance.getValue(), this.clickMiss.getValue(), this.clickPause.getValue());
+                }
+                int clickTick = mc.thePlayer.ticksExisted;
+                this.clickProcess.updateAim(clickTick, true, this.clickReaction.getValue());
                 boolean swap = false;
                 boolean blocked = false;
                 if (block) {
@@ -722,7 +751,16 @@ public class KillAura extends Module {
                         }
                     }
                     if (attack) {
-                        attacked = this.performAttack(event.getNewYaw(), event.getNewPitch());
+                        boolean clickAllowed = this.clickProcess.canClick(
+                                clickTick, true, this.clickAimGate.getValue(), this.clickReaction.getValue());
+                        if (clickAllowed) {
+                            attacked = this.performAttack(event.getNewYaw(), event.getNewPitch());
+                        } else {
+                            // Клик заблокирован симуляцией — не копим очередь.
+                            if (this.attackDelayMS < -50L) {
+                                this.attackDelayMS = -50L;
+                            }
+                        }
                     }
                 }
                 if (swap) {

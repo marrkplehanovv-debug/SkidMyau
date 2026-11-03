@@ -40,19 +40,30 @@ public class AiRotation extends Module {
     private final AiTarget context = new AiTarget();
 
     private volatile MlpModel angleModel;
+    private volatile MlpModel angleModelEntity;
+    private volatile MlpModel angleModelBlock;
     private volatile MlpModel aimModel;
     private volatile boolean modelsLoaded;
 
     private BufferedWriter writer;
     private String sessionId;
     private int linesWritten;
+    private int samplesWritten;
     private long lastFlush;
     private AiSample pending;
+
+    /** Тренажёр сам двигает цель и просит писать семплы, даже если модуль AI выключен. */
+    private volatile boolean trainerActive;
 
     public final ModeProperty rotation = new ModeProperty(
             "rotation", 1, new String[]{"BOOTSTRAP", "MODEL"});
     public final TextProperty model = new TextProperty("model", "angles-v2");
+    public final TextProperty modelEntity = new TextProperty("model-entity", "angles-entity");
+    public final TextProperty modelBlock = new TextProperty("model-block", "angles-block");
     public final TextProperty aimModelName = new TextProperty("aim-model", "aimpoint-v1");
+    /** Классификация датасета модели: ALL / ENTITY / BLOCK / SCAFFOLD. */
+    public final ModeProperty dataset = new ModeProperty(
+            "dataset", 0, new String[]{"ALL", "ENTITY", "BLOCK", "SCAFFOLD"});
     public final PercentProperty humanize = new PercentProperty("humanize", 70);
     public final IntProperty latency = new IntProperty("latency", 3, 0, 8);
     public final PercentProperty overshoot = new PercentProperty("overshoot", 12);
@@ -90,12 +101,38 @@ public class AiRotation extends Module {
 
     /** Контекст последней цели — нужен рекордеру. */
     public void noteTarget(AiTarget target) {
+        // Пока идёт обучение, данными из KillAura/Scaffold не пользуемся:
+        // иначе в датасет попадёт ИИ-ротация вместо движения мышью.
+        if (this.trainerActive) {
+            return;
+        }
         this.context.copyFrom(target);
     }
 
     public void noteIdle() {
+        if (this.trainerActive) {
+            return;
+        }
         this.context.reset(AiTarget.KIND_IDLE);
         this.context.key = 0L;
+    }
+
+    /** Цель, выставленная тренажёром. Такой контекст имеет приоритет над модулями. */
+    public void noteTrainerTarget(AiTarget target) {
+        this.context.copyFrom(target);
+    }
+
+    public void noteTrainerIdle() {
+        this.context.reset(AiTarget.KIND_IDLE);
+        this.context.key = 0L;
+    }
+
+    public boolean isTrainerActive() {
+        return this.trainerActive;
+    }
+
+    public void setTrainerActive(boolean active) {
+        this.trainerActive = active;
     }
 
     public AiTarget getContext() {
@@ -103,7 +140,12 @@ public class AiRotation extends Module {
     }
 
     public boolean isRecording() {
-        return this.isEnabled() && this.record.getValue();
+        return this.record.getValue() && (this.isEnabled() || this.trainerActive);
+    }
+
+    /** Сколько валидных (не skip) семплов записано в текущий файл. */
+    public int getSamplesWritten() {
+        return this.samplesWritten;
     }
 
     private void ensureModels() {
@@ -112,11 +154,35 @@ public class AiRotation extends Module {
         }
         this.modelsLoaded = true;
         this.angleModel = MlpModel.load(this.model.getValue(), null);
+        this.angleModelEntity = MlpModel.load(this.modelEntity.getValue(), null);
+        this.angleModelBlock = MlpModel.load(this.modelBlock.getValue(), null);
         this.aimModel = MlpModel.load(this.aimModelName.getValue(), null);
     }
 
     public MlpModel getAngleModel() {
         this.ensureModels();
+        return this.angleModel;
+    }
+
+    /**
+     * Возвращает модель для заданного типа цели с учётом классификации датасета.
+     * ENTITY-цели → модель entity, BLOCK/SCAFFOLD → модель block,
+     * если заданная модель не загружена — фолбэк на общую модель.
+     */
+    public MlpModel getAngleModelForKind(int kind) {
+        this.ensureModels();
+        String ds = this.dataset.getModeString();
+        if (ds.equals("ENTITY") || ds.equals("ALL")) {
+            if (kind == AiTarget.KIND_ENTITY && this.angleModelEntity != null) {
+                return this.angleModelEntity;
+            }
+        }
+        if (ds.equals("BLOCK") || ds.equals("SCAFFOLD") || ds.equals("ALL")) {
+            if ((kind == AiTarget.KIND_BLOCK || kind == AiTarget.KIND_SCAFFOLD)
+                    && this.angleModelBlock != null) {
+                return this.angleModelBlock;
+            }
+        }
         return this.angleModel;
     }
 
@@ -160,7 +226,7 @@ public class AiRotation extends Module {
     @Override
     public String[] getSuffix() {
         if (this.record.getValue()) {
-            return new String[]{"REC"};
+            return new String[]{"REC " + this.samplesWritten};
         }
         return new String[]{this.getAngleModel() != null ? "ML" : "BOOT"};
     }
@@ -177,7 +243,10 @@ public class AiRotation extends Module {
 
     @Override
     public void onDisabled() {
-        this.closeWriter();
+        // Во время тренажёра запись должна продолжаться даже если сам модуль AI выключили.
+        if (!this.trainerActive) {
+            this.closeWriter();
+        }
     }
 
     // ------------------------------------------------------------------
@@ -189,7 +258,7 @@ public class AiRotation extends Module {
         if (event.getType() != skidmyau.event.types.EventType.PRE || mc.thePlayer == null) {
             return;
         }
-        if (!this.isEnabled() || !this.record.getValue()) {
+        if (!this.isRecording()) {
             this.closeWriter();
             return;
         }
@@ -231,7 +300,8 @@ public class AiRotation extends Module {
 
         if (previous != null) {
             if (current.tick == previous.tick + 1 && previous.hasTarget
-                    && current.hasTarget && current.kind == previous.kind) {
+                    && current.hasTarget && current.kind == previous.kind
+                    && current.key == previous.key) {
                 previous.labelYaw = MathHelper.wrapAngleTo180_float(current.yaw - previous.yaw);
                 previous.labelPitch = current.pitch - previous.pitch;
                 previous.skip = false;
@@ -261,6 +331,8 @@ public class AiRotation extends Module {
             this.writer = new BufferedWriter(new OutputStreamWriter(
                     new FileOutputStream(file, true), StandardCharsets.UTF_8));
             this.linesWritten = 0;
+            this.samplesWritten = 0;
+            this.pending = null;
             this.lastFlush = System.currentTimeMillis();
             ChatUtil.sendFormatted(String.format(
                     "%sAI: recording to &7%s&r", skidmyau.SkidMyau.clientName, file.getPath()));
@@ -278,8 +350,13 @@ public class AiRotation extends Module {
                 this.writer.close();
             } catch (Throwable ignored) {
             }
+            int total = this.samplesWritten;
             this.writer = null;
             this.pending = null;
+            ChatUtil.sendFormatted(String.format(
+                    "%sAI: запись остановлена, семплов: &a%d&r (файл &7%s&r)",
+                    skidmyau.SkidMyau.clientName, total,
+                    this.sessionId == null ? "?" : this.sessionId + ".jsonl"));
         }
     }
 
@@ -315,6 +392,14 @@ public class AiRotation extends Module {
                     sample.faceWidth, sample.tower, sample.aimError, sample.visible,
                     sample.step, sample.kind, sample.key, sample.clickAge, sample.skip));
             this.linesWritten++;
+            if (!sample.skip) {
+                this.samplesWritten++;
+                if (this.samplesWritten % 200 == 0) {
+                    ChatUtil.sendFormatted(String.format(
+                            "%sAI: записано &a%d&r семплов",
+                            skidmyau.SkidMyau.clientName, this.samplesWritten));
+                }
+            }
             long now = System.currentTimeMillis();
             if (this.linesWritten % 100 == 0 || now - this.lastFlush > 2000L) {
                 this.writer.flush();

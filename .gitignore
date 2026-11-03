@@ -28,6 +28,9 @@ run
 *.iml
 out
 build
+configs
+docs
+gradle
 
 # Local reference dump of LiquidBounce sources (not part of the mod)
 liquidbounce-src/

@@ -3,6 +3,7 @@ package skidmyau.module.modules;
 import skidmyau.SkidMyau;
 import skidmyau.ai.AiTarget;
 import skidmyau.ai.AimOffset;
+import skidmyau.ai.ClickProcess;
 import skidmyau.ai.RotationPredictor;
 import skidmyau.event.EventTarget;
 import skidmyau.event.types.EventType;
@@ -11,6 +12,8 @@ import skidmyau.events.*;
 import skidmyau.management.RotationState;
 import skidmyau.module.Module;
 import skidmyau.property.properties.BooleanProperty;
+import skidmyau.property.properties.FloatProperty;
+import skidmyau.property.properties.IntProperty;
 import skidmyau.property.properties.ModeProperty;
 import skidmyau.property.properties.PercentProperty;
 import skidmyau.util.*;
@@ -31,6 +34,7 @@ import org.lwjgl.opengl.GL11;
 import java.awt.*;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Random;
 
 public class Scaffold extends Module {
     private static final Minecraft mc = Minecraft.getMinecraft();
@@ -68,6 +72,9 @@ public class Scaffold extends Module {
     private final RotationPredictor predictor = new RotationPredictor();
     private final AiTarget aiTarget = new AiTarget();
     private final AimOffset aimOffsetState = new AimOffset();
+    private final ClickProcess clickProcess = new ClickProcess();
+    private final Random random = new Random();
+    private int placeDelayCounter = 0;
     private float aimOffsetU = 0.5F;
     private float aimOffsetV = 0.5F;
     public final ModeProperty rotationMode = new ModeProperty("rotations", 2, new String[]{"NONE", "DEFAULT", "BACKWARDS", "SIDEWAYS", "AI"});
@@ -85,6 +92,16 @@ public class Scaffold extends Module {
     public final BooleanProperty swing = new BooleanProperty("swing", true);
     public final BooleanProperty itemSpoof = new BooleanProperty("item-spoof", false);
     public final BooleanProperty blockCounter = new BooleanProperty("block-counter", true);
+    // Клик-симуляция для постановки блоков (как в AutoClicker / KillAura).
+    public final ModeProperty placeClickMode = new ModeProperty("place-click-mode", 0, new String[]{"LEGACY", "NORMAL", "BUTTERFLY", "DOUBLE", "DRAG"});
+    public final PercentProperty placeVariance = new PercentProperty("place-variance", 25);
+    public final PercentProperty placeMiss = new PercentProperty("place-miss", 0);
+    public final PercentProperty placePause = new PercentProperty("place-pause", 3);
+    public final FloatProperty placeAimGate = new FloatProperty("place-aim-gate", 6.0F, 0.0F, 20.0F);
+    public final IntProperty placeReaction = new IntProperty("place-reaction", 2, 0, 8);
+    // Рандомизированная задержка между постановками блоков (тики).
+    public final IntProperty placeDelayMin = new IntProperty("place-delay-min", 1, 0, 20);
+    public final IntProperty placeDelayMax = new IntProperty("place-delay-max", 4, 0, 40);
 
     private boolean shouldStopSprint() {
         if (this.isTowering()) {
@@ -507,8 +524,25 @@ public class Scaffold extends Module {
                     }
                 }
                 if (blockData != null && hitVec != null && this.rotationTick <= 0) {
-                    this.place(blockData.blockPos(), blockData.facing(), hitVec);
-                    if (this.multiplace.getValue()) {
+                    // Клик-симуляция и рандомизированная задержка постановки блока.
+                    if (this.placeClickMode.getValue() != 0) {
+                        this.clickProcess.configure(
+                                this.placeClickMode.getValue(),
+                                8, 16,
+                                this.placeVariance.getValue(), this.placeMiss.getValue(), this.placePause.getValue());
+                    }
+                    int placeTick = mc.thePlayer.ticksExisted;
+                    this.clickProcess.updateAim(placeTick, true, this.placeReaction.getValue());
+                    boolean placeAllowed = this.clickProcess.canClick(
+                            placeTick, true, this.placeAimGate.getValue(), this.placeReaction.getValue());
+                    if (this.placeDelayCounter > 0) {
+                        this.placeDelayCounter--;
+                    }
+                    if (placeAllowed && this.placeDelayCounter <= 0) {
+                        this.place(blockData.blockPos(), blockData.facing(), hitVec);
+                        this.placeDelayCounter = this.placeDelayMin.getValue()
+                                + this.random.nextInt(Math.max(1, this.placeDelayMax.getValue() - this.placeDelayMin.getValue() + 1));
+                        if (this.multiplace.getValue()) {
                         for (int i = 0; i < 3; i++) {
                             blockData = this.getBlockData();
                             if (blockData == null) {
@@ -539,6 +573,7 @@ public class Scaffold extends Module {
                                 this.place(blockData.blockPos(), blockData.facing(), mop.hitVec);
                             }
                         }
+                    }
                     }
                 }
                 if (this.targetFacing != null) {
@@ -834,6 +869,7 @@ public class Scaffold extends Module {
         this.towering = false;
         this.predictor.reset();
         this.aimOffsetState.reset();
+        this.placeDelayCounter = 0;
     }
 
     @Override
