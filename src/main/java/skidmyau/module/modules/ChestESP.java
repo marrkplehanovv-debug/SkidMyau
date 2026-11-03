@@ -45,9 +45,9 @@ public class ChestESP extends Module {
                 maxX = maxZ = 0.9375;
                 if (block instanceof BlockChest) {
                     if (block.canProvidePower()) {
-                        color = new Color(this.trappedChest.getValue());
+                        color = new Color(this.trappedChest.getValue(), true);
                     } else {
-                        color = new Color(this.chest.getValue());
+                        color = new Color(this.chest.getValue(), true);
                     }
                     EnumFacing facing = mc.theWorld.getBlockState(chest.getPos()).getValue(BlockChest.FACING);
                     switch (facing) {
@@ -83,8 +83,9 @@ public class ChestESP extends Module {
                             continue;
                     }
                 } else {
-                    color = new Color(this.enderChest.getValue());
+                    color = new Color(this.enderChest.getValue(), true);
                 }
+                if (color.getAlpha() == 0) continue;
                 AxisAlignedBB aabb = new AxisAlignedBB(
                         (double) chest.getPos().getX() + minX,
                         (double) chest.getPos().getY() + 0.0,
@@ -99,7 +100,7 @@ public class ChestESP extends Module {
                                 -((IAccessorRenderManager) mc.getRenderManager()).getRenderPosZ()
                         );
                 RenderUtil.drawBoundingBox(
-                        aabb, color.getRed(), color.getGreen(), color.getBlue(), 255, 1.5F
+                        aabb, color.getRed(), color.getGreen(), color.getBlue(), color.getAlpha(), 1.5F
                 );
                 if (this.tracers.getValue()) {
                     Vec3 vec;

@@ -28,3 +28,6 @@ run
 *.iml
 out
 build
+
+# Local reference dump of LiquidBounce sources (not part of the mod)
+liquidbounce-src/

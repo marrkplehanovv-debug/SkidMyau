@@ -47,20 +47,6 @@ public class RotationUtil {
         return RotationUtil.getRotations(targetX, targetY, targetZ, currentYaw, currentPitch, 180.0f, 0.0f);
     }
 
-    public static float[] getRotationsToRaw(double targetX, double targetY, double targetZ, float currentYaw, float currentPitch) {
-        double horizontalDistance = Math.sqrt(targetX * targetX + targetZ * targetZ);
-        float yawDelta = MathHelper.wrapAngleTo180_float(
-                (float) (Math.atan2(targetZ, targetX) * 180.0 / Math.PI) - 90.0f - currentYaw
-        );
-        float pitchDelta = MathHelper.wrapAngleTo180_float(
-                (float) (-Math.atan2(targetY, horizontalDistance) * 180.0 / Math.PI) - currentPitch
-        );
-        return new float[]{
-                MathHelper.wrapAngleTo180_float(currentYaw + yawDelta),
-                MathHelper.clamp_float(currentPitch + pitchDelta, -90.0f, 90.0f)
-        };
-    }
-
     public static float[] getRotations(double targetX, double targetY, double targetZ, float currentYaw, float currentPitch, float maxAngle, float smoothFactor) {
         double horizontalDistance = Math.sqrt(targetX * targetX + targetZ * targetZ);
         float yawDelta = MathHelper.wrapAngleTo180_float((float) (Math.atan2(targetZ, targetX) * 180.0 / Math.PI) - 90.0f - currentYaw);
@@ -128,17 +114,10 @@ public class RotationUtil {
     }
 
     public static MovingObjectPosition rayTrace(float yaw, float pitch, double distance, float partialTicks) {
-        return RotationUtil.rayTraceFrom(RotationUtil.mc.thePlayer.getPositionEyes(partialTicks), yaw, pitch, distance);
-    }
-
-    public static MovingObjectPosition rayTraceFrom(Vec3 eyePos, float yaw, float pitch, double distance) {
-        Vec3 lookVec = RotationUtil.getLookVec(yaw, pitch);
+        Vec3 eyePos = RotationUtil.mc.thePlayer.getPositionEyes(partialTicks);
+        Vec3 lookVec = ((IAccessorEntity) RotationUtil.mc.thePlayer).callGetVectorForRotation(pitch, yaw);
         Vec3 targetPos = eyePos.addVector(lookVec.xCoord * distance, lookVec.yCoord * distance, lookVec.zCoord * distance);
         return RotationUtil.mc.theWorld.rayTraceBlocks(eyePos, targetPos);
-    }
-
-    public static Vec3 getLookVec(float yaw, float pitch) {
-        return ((IAccessorEntity) RotationUtil.mc.thePlayer).callGetVectorForRotation(pitch, yaw);
     }
 
     public static MovingObjectPosition rayTrace(Entity entity) {
