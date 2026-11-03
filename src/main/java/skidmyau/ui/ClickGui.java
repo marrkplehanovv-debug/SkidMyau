@@ -43,6 +43,7 @@ public class ClickGui extends GuiScreen {
         combatModules.add(SkidMyau.moduleManager.getModule(MoreKB.class));
         combatModules.add(SkidMyau.moduleManager.getModule(Refill.class));
         combatModules.add(SkidMyau.moduleManager.getModule(HitSelect.class));
+        combatModules.add(SkidMyau.moduleManager.getModule(AiRotation.class));
 
         List<Module> movementModules = new ArrayList<>();
         movementModules.add(SkidMyau.moduleManager.getModule(AntiAFK.class));
@@ -106,6 +107,11 @@ public class ClickGui extends GuiScreen {
         miscModules.add(SkidMyau.moduleManager.getModule(InventoryClicker.class));
 
         Comparator<Module> comparator = Comparator.comparing(m -> m.getName().toLowerCase());
+        // Модуль мог быть удалён/переименован — не падаем на null в категориях.
+        for (List<Module> list : Arrays.asList(combatModules, movementModules, renderModules,
+                playerModules, miscModules)) {
+            list.removeIf(Objects::isNull);
+        }
         combatModules.sort(comparator);
         movementModules.sort(comparator);
         renderModules.sort(comparator);
@@ -121,9 +127,14 @@ public class ClickGui extends GuiScreen {
 
         for (Module module : SkidMyau.moduleManager.modules.values()) {
             if (!registered.contains(module)) {
-                throw new RuntimeException(module.getClass().getName() + " is unregistered to click gui.");
+                // Не роняем весь GUI из-за забытой регистрации: модуль,
+                // которого нет ни в одной категории, попадает в Misc.
+                System.err.println("[SkidMyau] " + module.getClass().getName()
+                        + " is not registered in ClickGui, falling back to Misc");
+                miscModules.add(module);
             }
         }
+        miscModules.sort(comparator);
 
         this.categoryList = new ArrayList<>();
         int topOffset = 5;
