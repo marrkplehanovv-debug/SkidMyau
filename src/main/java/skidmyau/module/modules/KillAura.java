@@ -2,6 +2,8 @@ package skidmyau.module.modules;
 
 import com.google.common.base.CaseFormat;
 import skidmyau.SkidMyau;
+import skidmyau.ai.AiTarget;
+import skidmyau.ai.RotationPredictor;
 import skidmyau.enums.BlinkModules;
 import skidmyau.event.EventManager;
 import skidmyau.event.EventTarget;
@@ -55,6 +57,8 @@ public class KillAura extends Module {
     private static final DecimalFormat df = new DecimalFormat("+0.0;-0.0", new DecimalFormatSymbols(Locale.US));
     private final TimerUtil timer = new TimerUtil();
     private AttackData target = null;
+    private final RotationPredictor predictor = new RotationPredictor();
+    private final AiTarget aiTarget = new AiTarget();
     private int switchTick = 0;
     private boolean hitRegistered = false;
     private boolean blockingState = false;
@@ -339,7 +343,7 @@ public class KillAura extends Module {
         this.minCPS = new IntProperty("min-aps", 14, 1, 20);
         this.maxCPS = new IntProperty("max-aps", 14, 1, 20);
         this.switchDelay = new IntProperty("switch-delay", 150, 0, 1000);
-        this.rotations = new ModeProperty("rotations", 2, new String[]{"NONE", "LEGIT", "SILENT", "LOCK_VIEW"});
+        this.rotations = new ModeProperty("rotations", 2, new String[]{"NONE", "LEGIT", "SILENT", "LOCK_VIEW", "AI"});
         this.moveFix = new ModeProperty("move-fix", 1, new String[]{"NONE", "SILENT", "STRICT"});
         this.smoothing = new PercentProperty("smoothing", 0);
         this.angleStep = new IntProperty("angle-step", 90, 30, 180);
@@ -411,6 +415,18 @@ public class KillAura extends Module {
             }
             boolean attack = this.target != null && this.canAttack();
             boolean block = attack && this.canAutoBlock();
+            // Рекордер семплов должен видеть цель при любом режиме ротации.
+            AiRotation recorder = AiRotation.get();
+            if (recorder != null && recorder.isRecording()) {
+                if (this.target == null) {
+                    recorder.noteIdle();
+                } else if (this.rotations.getValue() != 4 || !recorder.isEnabled()) {
+                    float[] rec = RotationUtil.getRotationsToBox(
+                            this.target.getBox(), event.getYaw(), event.getPitch(), 180.0F, 0.0F);
+                    this.fillAiTarget(rec[0], rec[1]);
+                    recorder.noteTarget(this.aiTarget);
+                }
+            }
             if (!block) {
                 SkidMyau.blinkManager.setBlinkState(false, BlinkModules.AUTO_BLOCK);
                 this.isBlocking = false;
@@ -685,6 +701,25 @@ public class KillAura extends Module {
                         if (this.moveFix.getValue() != 0 || this.rotations.getValue() == 3) {
                             event.setPervRotation(rotations[0], 1);
                         }
+                    } else if (this.rotations.getValue() == 4) {
+                        AiRotation ai = AiRotation.get();
+                        if (ai != null && ai.isEnabled() && this.applyAiRotation(event, ai)) {
+                            if (this.moveFix.getValue() != 0) {
+                                event.setPervRotation(event.getNewYaw(), 1);
+                            }
+                        } else {
+                            float[] rotations = RotationUtil.getRotationsToBox(
+                                    this.target.getBox(),
+                                    event.getYaw(),
+                                    event.getPitch(),
+                                    (float) this.angleStep.getValue() + RandomUtil.nextFloat(-5.0F, 5.0F),
+                                    (float) this.smoothing.getValue() / 100.0F
+                            );
+                            event.setRotation(rotations[0], rotations[1], 1);
+                            if (this.moveFix.getValue() != 0) {
+                                event.setPervRotation(rotations[0], 1);
+                            }
+                        }
                     }
                     if (attack) {
                         attacked = this.performAttack(event.getNewYaw(), event.getNewPitch());
@@ -932,6 +967,11 @@ public class KillAura extends Module {
         this.blockingState = false;
         this.isBlocking = false;
         this.fakeBlockState = false;
+        this.predictor.reset();
+        AiRotation ai = AiRotation.get();
+        if (ai != null) {
+            ai.noteIdle();
+        }
     }
 
     @Override
@@ -980,6 +1020,45 @@ public class KillAura extends Module {
                 this.autoBlockMaxCPS.setValue(10.0F);
             }
         }
+    }
+
+    /**
+     * ИИ-ротация цели-сущности. Возвращает false, если применить не удалось —
+     * тогда вызывающий код использует обычный RotationUtil.
+     */
+    private boolean applyAiRotation(UpdateEvent event, AiRotation ai) {
+        if (this.target == null || mc.thePlayer == null) {
+            return false;
+        }
+        float[] target = RotationUtil.getRotationsToBox(
+                this.target.getBox(), event.getYaw(), event.getPitch(), 180.0F, 0.0F);
+        this.fillAiTarget(target[0], target[1]);
+        ai.noteTarget(this.aiTarget);
+        return this.predictor.apply(event, this.aiTarget, 1, ai);
+    }
+
+    /** Заполняет контекст цели-сущности для предиктора/рекордера. */
+    private void fillAiTarget(float targetYaw, float targetPitch) {
+        AiTarget context = this.aiTarget;
+        context.reset(AiTarget.KIND_ENTITY);
+        context.yaw = targetYaw;
+        context.pitch = targetPitch;
+        EntityLivingBase entity = this.target.getEntity();
+        context.motionX = entity.posX - entity.prevPosX;
+        context.motionY = entity.posY - entity.prevPosY;
+        context.motionZ = entity.posZ - entity.prevPosZ;
+        context.hurtTime = entity.hurtTime;
+        context.key = entity.getEntityId();
+        double dx = entity.posX - mc.thePlayer.posX;
+        double dy = entity.posY + (double) entity.height * 0.5
+                - (mc.thePlayer.posY + (double) mc.thePlayer.getEyeHeight());
+        double dz = entity.posZ - mc.thePlayer.posZ;
+        context.distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        context.aimError = Math.abs(MathHelper.wrapAngleTo180_float(
+                targetYaw - mc.thePlayer.rotationYaw))
+                + Math.abs(targetPitch - mc.thePlayer.rotationPitch);
+        context.visible = RotationUtil.rayTrace(
+                entity.getEntityBoundingBox(), targetYaw, targetPitch, 8.0) != null;
     }
 
     @Override

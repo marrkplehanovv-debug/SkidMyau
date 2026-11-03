@@ -3,6 +3,7 @@ package skidmyau.module.modules;
 import skidmyau.event.EventTarget;
 import skidmyau.event.types.EventType;
 import skidmyau.event.types.Priority;
+import skidmyau.ai.ClickProcess;
 import skidmyau.events.LeftClickMouseEvent;
 import skidmyau.events.TickEvent;
 import skidmyau.module.Module;
@@ -10,8 +11,11 @@ import skidmyau.util.*;
 import skidmyau.property.properties.BooleanProperty;
 import skidmyau.property.properties.FloatProperty;
 import skidmyau.property.properties.IntProperty;
+import skidmyau.property.properties.ModeProperty;
+import skidmyau.property.properties.PercentProperty;
 import net.minecraft.client.Minecraft;
 import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.util.MathHelper;
 import net.minecraft.util.MovingObjectPosition.MovingObjectType;
 import net.minecraft.world.WorldSettings.GameType;
 
@@ -23,6 +27,14 @@ public class AutoClicker extends Module {
     private long clickDelay = 0L;
     private boolean blockHitPending = false;
     private long blockHitDelay = 0L;
+    private final ClickProcess clickProcess = new ClickProcess();
+    public final ModeProperty clickMode = new ModeProperty(
+            "click-mode", 0, new String[]{"LEGACY", "NORMAL", "BUTTERFLY", "DOUBLE", "DRAG"});
+    public final PercentProperty clickVariance = new PercentProperty("click-variance", 25);
+    public final FloatProperty clickAimGate = new FloatProperty("click-aim-gate", 6.0F, 0.0F, 20.0F);
+    public final IntProperty clickReaction = new IntProperty("click-reaction", 2, 0, 8);
+    public final PercentProperty clickMiss = new PercentProperty("click-miss", 0);
+    public final PercentProperty clickPause = new PercentProperty("click-pause", 3);
     public final IntProperty minCPS = new IntProperty("min-cps", 8, 1, 20);
     public final IntProperty maxCPS = new IntProperty("max-cps", 12, 1, 20);
     public final BooleanProperty blockHit = new BooleanProperty("block-hit", false);
@@ -35,6 +47,12 @@ public class AutoClicker extends Module {
     public final FloatProperty hitBoxHorizontal = new FloatProperty("hit-box-horizontal", 0.2F, 0.0F, 1.0F, this.breakBlocks::getValue);
 
     private long getNextClickDelay() {
+        if (this.clickMode.getValue() != 0) {
+            int delay = this.clickProcess.nextDelayMs();
+            if (delay > 0) {
+                return delay;
+            }
+        }
         return 1000L / RandomUtil.nextLong(this.minCPS.getValue(), this.maxCPS.getValue());
     }
 
@@ -89,6 +107,41 @@ public class AutoClicker extends Module {
                 .anyMatch(this::isValidTarget);
     }
 
+    /** Наведён ли прицел на игрока в пределах click-aim-gate градусов. */
+    private boolean isAimingAtTarget() {
+        if (mc.theWorld == null || mc.thePlayer == null) {
+            return false;
+        }
+        float gate = Math.max(1.0F, this.clickAimGate.getValue());
+        double range = Math.max(3.0, (double) this.range.getValue());
+        for (Object object : mc.theWorld.loadedEntityList) {
+            if (!(object instanceof EntityPlayer)) {
+                continue;
+            }
+            EntityPlayer player = (EntityPlayer) object;
+            if (player == mc.thePlayer || player.deathTime > 0) {
+                continue;
+            }
+            if ((double) mc.thePlayer.getDistanceToEntity(player) > range + 1.0) {
+                continue;
+            }
+            float[] rotations = RotationUtil.getRotationsToBox(
+                    player.getEntityBoundingBox(),
+                    mc.thePlayer.rotationYaw,
+                    mc.thePlayer.rotationPitch,
+                    180.0F,
+                    0.0F
+            );
+            float error = Math.abs(MathHelper.wrapAngleTo180_float(
+                    rotations[0] - mc.thePlayer.rotationYaw))
+                    + Math.abs(rotations[1] - mc.thePlayer.rotationPitch);
+            if (error <= gate) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public AutoClicker() {
         super("AutoClicker", false);
     }
@@ -115,13 +168,32 @@ public class AutoClicker extends Module {
                     KeyBindUtil.updateKeyState(mc.gameSettings.keyBindUseItem.getKeyCode());
                 }
                 if (this.isEnabled() && this.canClick() && mc.gameSettings.keyBindAttack.isKeyDown()) {
-                    if (!mc.thePlayer.isUsingItem()) {
+                    boolean aiClick = this.clickMode.getValue() != 0;
+                    if (aiClick) {
+                        this.clickProcess.configure(
+                                this.clickMode.getValue(), this.minCPS.getValue(), this.maxCPS.getValue(),
+                                this.clickVariance.getValue(), this.clickMiss.getValue(), this.clickPause.getValue());
+                    }
+                    boolean allowed = true;
+                    if (aiClick) {
+                        int tick = mc.thePlayer.ticksExisted;
+                        boolean aiming = this.isAimingAtTarget();
+                        this.clickProcess.updateAim(tick, aiming, this.clickReaction.getValue());
+                        allowed = this.clickProcess.canClick(
+                                tick, aiming, this.clickAimGate.getValue(), this.clickReaction.getValue());
+                    }
+                    if (allowed && !mc.thePlayer.isUsingItem()) {
                         while (this.clickDelay <= 0L) {
                             this.clickPending = true;
                             this.clickDelay = this.clickDelay + this.getNextClickDelay();
+                            AiRotation.notifyClick();
                             KeyBindUtil.setKeyBindState(mc.gameSettings.keyBindAttack.getKeyCode(), false);
                             KeyBindUtil.pressKeyOnce(mc.gameSettings.keyBindAttack.getKeyCode());
                         }
+                    } else if (this.clickDelay < -50L) {
+                        // Клик заблокирован (гейт/реакция/пауза) — не копим
+                        // очередь кликов, иначе после разблокировки пойдёт залп.
+                        this.clickDelay = -50L;
                     }
                     if (this.blockHit.getValue()
                             && this.blockHitDelay <= 0L

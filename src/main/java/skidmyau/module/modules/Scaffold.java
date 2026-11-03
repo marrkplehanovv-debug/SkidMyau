@@ -1,6 +1,9 @@
 package skidmyau.module.modules;
 
 import skidmyau.SkidMyau;
+import skidmyau.ai.AiTarget;
+import skidmyau.ai.AimOffset;
+import skidmyau.ai.RotationPredictor;
 import skidmyau.event.EventTarget;
 import skidmyau.event.types.EventType;
 import skidmyau.event.types.Priority;
@@ -62,7 +65,12 @@ public class Scaffold extends Module {
     private boolean shouldKeepY = false;
     private boolean towering = false;
     private EnumFacing targetFacing = null;
-    public final ModeProperty rotationMode = new ModeProperty("rotations", 2, new String[]{"NONE", "DEFAULT", "BACKWARDS", "SIDEWAYS"});
+    private final RotationPredictor predictor = new RotationPredictor();
+    private final AiTarget aiTarget = new AiTarget();
+    private final AimOffset aimOffsetState = new AimOffset();
+    private float aimOffsetU = 0.5F;
+    private float aimOffsetV = 0.5F;
+    public final ModeProperty rotationMode = new ModeProperty("rotations", 2, new String[]{"NONE", "DEFAULT", "BACKWARDS", "SIDEWAYS", "AI"});
     public final ModeProperty moveFix = new ModeProperty("move-fix", 1, new String[]{"NONE", "SILENT"});
     public final ModeProperty sprintMode = new ModeProperty("sprint", 0, new String[]{"NONE", "VANILLA"});
     public final PercentProperty groundMotion = new PercentProperty("ground-motion", 100);
@@ -238,6 +246,32 @@ public class Scaffold extends Module {
         }
     }
 
+    /** Заполняет контекст цели для предиктора/рекордера. */
+    private void fillAiTarget(BlockData blockData, float targetYaw, float targetPitch) {
+        boolean tower = this.isTowering();
+        AiTarget target = this.aiTarget;
+        target.reset(tower ? AiTarget.KIND_SCAFFOLD : AiTarget.KIND_BLOCK);
+        target.yaw = targetYaw;
+        target.pitch = targetPitch;
+        double dx = (double) blockData.blockPos().getX() + 0.5 - mc.thePlayer.posX;
+        double dy = (double) blockData.blockPos().getY() + 0.5
+                - (mc.thePlayer.posY + (double) mc.thePlayer.getEyeHeight());
+        double dz = (double) blockData.blockPos().getZ() + 0.5 - mc.thePlayer.posZ;
+        target.distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        target.faceWidth = (float) Math.toDegrees(
+                Math.atan2(1.0, Math.max(0.5, target.distance)));
+        target.faceU = this.aimOffsetU;
+        target.faceV = this.aimOffsetV;
+        target.tower = tower;
+        target.hurtTime = mc.thePlayer.hurtTime;
+        target.key = ((long) blockData.blockPos().hashCode() << 4)
+                | (long) blockData.facing().ordinal();
+        target.aimError = Math.abs(MathHelper.wrapAngleTo180_float(
+                targetYaw - mc.thePlayer.rotationYaw))
+                + Math.abs(targetPitch - mc.thePlayer.rotationPitch);
+        target.visible = true;
+    }
+
     public Scaffold() {
         super("Scaffold", false);
     }
@@ -297,6 +331,7 @@ public class Scaffold extends Module {
                 if (!this.canRotate) {
                     switch (this.rotationMode.getValue()) {
                         case 1:
+                        case 4:
                             if (this.yaw == -180.0F && this.pitch == 0.0F) {
                                 this.yaw = RotationUtil.quantizeAngle(diagonalYaw);
                                 this.pitch = RotationUtil.quantizeAngle(85.0F);
@@ -322,6 +357,13 @@ public class Scaffold extends Module {
                     }
                 }
                 BlockData blockData = this.getBlockData();
+                if (blockData == null) {
+                    // Нет цели — рекордер должен видеть простой, а не старую цель.
+                    AiRotation idleAi = AiRotation.get();
+                    if (idleAi != null && idleAi.isRecording()) {
+                        idleAi.noteIdle();
+                    }
+                }
                 Vec3 hitVec = null;
                 if (blockData != null) {
                     double[] x = placeOffsets;
@@ -378,6 +420,48 @@ public class Scaffold extends Module {
                         this.pitch = bestPitch;
                         this.canRotate = true;
                     }
+                    // Смещение точки прицеливания от центра грани.
+                    // Работает только при включённом модуле AI; по умолчанию
+                    // модуль выключен, поэтому старый плейсмент не меняется.
+                    // Валидируем рейкастом: если смещённая точка не попадает
+                    // в нужную грань, остаёмся в центре — плейсмент важнее.
+                    AiRotation ai = AiRotation.get();
+                    if (ai != null && ai.isEnabled() && ai.aimOffset.getValue() != 0) {
+                        double cx = (double) blockData.blockPos().getX() + 0.5 - mc.thePlayer.posX;
+                        double cy = (double) blockData.blockPos().getY() + 0.5
+                                - (mc.thePlayer.posY + (double) mc.thePlayer.getEyeHeight());
+                        double cz = (double) blockData.blockPos().getZ() + 0.5 - mc.thePlayer.posZ;
+                        float blockDistance = (float) Math.sqrt(cx * cx + cy * cy + cz * cz);
+                        float faceWidth = (float) Math.toDegrees(
+                                Math.atan2(1.0, Math.max(0.5, (double) blockDistance)));
+                        long key = ((long) blockData.blockPos().hashCode() << 4)
+                                | (long) blockData.facing().ordinal();
+                        float[] uv = this.aimOffsetState.update(
+                                key, ai.aimOffset.getValue(), ai.aimScale.getValue(),
+                                ai.aimResample.getValue(), ai.aimDrift.getValue(),
+                                faceWidth, blockDistance, ai.getAimModel());
+                        float[] angles = AimOffset.toAngles(uv[0], uv[1], faceWidth);
+                        float offsetYaw = this.yaw + angles[0];
+                        float offsetPitch = MathHelper.clamp_float(this.pitch + angles[1], -90.0F, 90.0F);
+                        MovingObjectPosition mop = RotationUtil.rayTrace(
+                                offsetYaw, offsetPitch, mc.playerController.getBlockReachDistance(), 1.0F);
+                        if (mop != null
+                                && mop.typeOfHit == MovingObjectType.BLOCK
+                                && mop.getBlockPos().equals(blockData.blockPos())
+                                && mop.sideHit == blockData.facing()) {
+                            this.yaw = offsetYaw;
+                            this.pitch = offsetPitch;
+                            this.aimOffsetU = uv[0];
+                            this.aimOffsetV = uv[1];
+                        } else {
+                            this.aimOffsetU = 0.5F;
+                            this.aimOffsetV = 0.5F;
+                        }
+                    }
+                    if (ai != null && ai.isRecording()) {
+                        this.fillAiTarget(blockData, this.yaw, this.pitch);
+                        ai.noteTarget(this.aiTarget);
+                    }
                 }
                 if (this.canRotate && MoveUtil.isForwardPressed() && Math.abs(MathHelper.wrapAngleTo180_float(yawDiffTo180 - this.yaw)) < 90.0F) {
                     switch (this.rotationMode.getValue()) {
@@ -407,9 +491,19 @@ public class Scaffold extends Module {
                         this.rotationTick = 3;
                         this.towering = true;
                     }
-                    event.setRotation(targetYaw, targetPitch, 3);
+                    boolean aiApplied = false;
+                    AiRotation ai = AiRotation.get();
+                    if (this.rotationMode.getValue() == 4 && ai != null && ai.isEnabled()
+                            && blockData != null) {
+                        this.fillAiTarget(blockData, targetYaw, targetPitch);
+                        ai.noteTarget(this.aiTarget);
+                        aiApplied = this.predictor.apply(event, this.aiTarget, 3, ai);
+                    }
+                    if (!aiApplied) {
+                        event.setRotation(targetYaw, targetPitch, 3);
+                    }
                     if (this.moveFix.getValue() == 1) {
-                        event.setPervRotation(targetYaw, 3);
+                        event.setPervRotation(aiApplied ? event.getNewYaw() : targetYaw, 3);
                     }
                 }
                 if (blockData != null && hitVec != null && this.rotationTick <= 0) {
@@ -738,6 +832,8 @@ public class Scaffold extends Module {
         this.towerTick = 0;
         this.towerDelay = 0;
         this.towering = false;
+        this.predictor.reset();
+        this.aimOffsetState.reset();
     }
 
     @Override
@@ -745,6 +841,8 @@ public class Scaffold extends Module {
         if (mc.thePlayer != null && this.lastSlot != -1) {
             mc.thePlayer.inventory.currentItem = this.lastSlot;
         }
+        this.predictor.reset();
+        this.aimOffsetState.reset();
     }
 
     public static class BlockData {

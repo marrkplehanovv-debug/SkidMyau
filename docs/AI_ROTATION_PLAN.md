@@ -205,37 +205,44 @@ POST
 ```json
 {
   "v": 2,
-  "s": "2026-11-03T12-00-00_ab12",
-  "t": 1730000000000,
+  "s": "20261103-120000",
   "tick": 1042,
-  "kind": "ENTITY",
   "yaw": 91.3241, "pitch": 12.5562,
   "pyaw": 90.1120, "ppitch": 11.9980,
+  "dyaw": 1.2121, "dpitch": 0.5582,
   "tyaw": 96.4420, "tpitch": 18.2210,
-  "lab_yaw": 1.2121, "lab_pitch": 0.5582,
   "dist": 2.83,
-  "pmx": 0.0781, "pmz": -0.1622, "pmy": -0.0784,
+  "pmx": 0.0781, "pmy": -0.0784, "pmz": -0.1622,
   "tmx": 0.0, "tmy": 0.0, "tmz": 0.0,
   "onGround": true,
-  "hurtTime": 0,
-  "step": 0.0096,
+  "hurt": 0,
   "fu": 0.5, "fv": 0.5,
   "faceW": 37.5,
   "tower": false,
   "aimErr": 3.1,
   "vis": true,
-  "click": 0
+  "step": 0.0096,
+  "kind": 1,
+  "key": 4711,
+  "clk": 7,
+  "skip": false
 }
 ```
 
-Поля:
-- `lab_yaw/lab_pitch` — метка (дельта `t → t+1`), дописывается постфактум;
-  если тик потерян (телепорт/лаг), ставится `"skip": true` и семпл не используется.
-- `kind` ∈ `ENTITY | BLOCK | SCAFFOLD | TOWER | IDLE`.
-- `fu/fv` — координаты точки прицела в локальной системе грани (0..1), для блоков.
-- `faceW` — видимая угловая ширина грани в градусах (для AimPointNet).
-- `step` — шаг мыши при текущей sensitivity (см. §8.2).
-- `aimErr` — угловое расстояние от текущего взгляда до выбранной точки.
+Поля (реализовано в `AiRotation.AiSample`):
+- `yaw/pitch` — итоговая ротация этого тика (после всех модулей);
+- `pyaw/ppitch` — ротация предыдущего тика;
+- `dyaw/dpitch` — метка: дельта `t → t+1`, дописывается постфактум;
+  если тик потерян (телепорт/лаг), ставится `"skip": true` и семпл не используется;
+- `tyaw/tpitch` — абсолютная цель (центр грани/бокса), до сглаживания;
+- `kind` ∈ `0 IDLE | 1 ENTITY | 2 BLOCK | 3 SCAFFOLD` (int, как в `AiTarget`);
+- `key` — идентификатор цели (entityId либо hashCode позиции+грани);
+- `fu/fv` — координаты точки прицела в локальной системе грани (0..1);
+- `faceW` — видимая угловая ширина грани в градусах (для AimPointNet);
+- `step` — шаг мыши при текущей sensitivity (см. §8.2);
+- `aimErr` — угловое расстояние от текущего взгляда до цели;
+- `clk` — тиков с последнего клика AutoClicker/KillAura;
+- `pm*` — движение игрока за тик, `tm*` — движение цели.
 
 Почему JSONL, а не бинарь: удобно диффить, читать Python-ом, докачивать.
 
@@ -367,9 +374,11 @@ Linear(32, out)
 Отдельная маленькая сеть, **не на каждый тик**:
 
 ```
-in 8: [dist, faceW, faceH, approachAngle, speed, onGround, kind, tower]
+in 8: [dist/6, faceW/90, (u-0.5)*2, (v-0.5)*2, speed*20, onGround, aimScale, drift]
 Linear(8,32) → ReLU → Linear(32,16) → ReLU → Linear(16,4)  // μu, μv, logσu, logσv
 ```
+(`AimOffset.sample`, режим `LEARNED`; u/v — предыдущая точка, чтобы сеть
+предсказывала не абсолют, а следующее положение.)
 Loss — Gaussian NLL по записанным `fu/fv`.
 
 Поведение:
@@ -423,26 +432,24 @@ f32[outSize]        bias
 ```
 `inSize` первого слоя = inputSize, далее = предыдущий outSize.
 
-Рядом `angles-v2.json`:
+Рядом `angles-v2.json` (пишет `tools/ai/skm.py:write_meta`):
 ```json
 {
   "name": "angles-v2",
-  "version": 1,
   "inputSize": 26,
   "outputSize": 4,
-  "features": ["dYawTotal", "..."],
+  "features": ["total_yaw", "... 26 имён ..."],
+  "hidden": [128, 64, 32],
   "inputMean": [ ... 26 ... ],
   "inputStd":  [ ... 26 ... ],
-  "outputScale": [30.0, 20.0],
+  "outputScale": [3.12, 2.04, 1.0, 1.0],
   "stochastic": true,
-  "trainedAt": "2026-11-03",
-  "sessions": 14,
-  "valLoss": 0.412,
-  "sha256": "..."
+  "note": "outputScale in degrees; sigma = exp(log_sigma) * scale"
 }
 ```
-Java обязана проверять `inputSize`/`outputSize`/`sha256` и падать в fallback,
-а не в краш.
+`outputScale[0..1]` — std дельт в градусах: `delta = out[i] * scale[i]`,
+`sigma = exp(out[2..3]) * scale[0..1]`. Java обязана проверять
+`inputSize`/`outputSize` и падать в bootstrap, а не в краш.
 
 ---
 
@@ -765,16 +772,19 @@ aimErr < errThreshold(engagement)  &&  modelConverging  &&  !reactionDelay
 ### 9.6 Свойства (пример)
 
 ```java
-clickMode          = ModeProperty("click-mode", 0, {"OFF","NORMAL","BUTTERFLY","DOUBLE","DRAG"});
-clickCpsMin/Max    = IntProperty 8..20
-clickVariance      = FloatProperty 0..100      // CV интервалов
-clickBurstChance   = FloatProperty 0..100
-clickMissChance    = FloatProperty 0..100
-clickPauseMin/Max  = IntProperty (тики)
-clickHoldTicks     = IntProperty 1..3
-clickAimGate       = FloatProperty 1..15 (градусы)
-clickReactionTicks = IntProperty 0..8
+clickMode          = ModeProperty("click-mode", 0, {"LEGACY","NORMAL","BUTTERFLY","DOUBLE","DRAG"});
+minCPS/maxCPS      = IntProperty 1..20          // уже были, используются как цель
+clickVariance      = PercentProperty 0..100      // разброс Gamma (k)
+clickMiss          = PercentProperty 0..100      // клик мимо / пропуск
+clickPause         = PercentProperty 0..100      // шанс паузы на переприцел
+clickAimGate       = FloatProperty 0..20 (градусы)
+clickReaction      = IntProperty 0..8 (тики)
 ```
+
+Реализовано именно так (`AutoClicker`, `skidmyau.ai.ClickProcess`).
+Параметры Gamma/OU пока заданы вручную — фит по человеческим кликам
+(§9.5 п.1 `ClickRecorder`) ещё не сделан; это следующий шаг после
+сбора данных. `LEGACY` воспроизводит старое поведение 1:1.
 
 ---
 
@@ -964,3 +974,37 @@ liquidbounce-src/src/main/kotlin/net/ccbluex/liquidbounce/
 - выход: `[nextΔyaw, nextΔpitch]`;
 - применение: `newRotation = current + output * multiplier`, затем correction-режим
   (`InterpolationAngleSmooth` 2..5 тиков — самый «человечный» вариант).
+
+---
+
+## 15. Статус реализации (на 2026-11-03)
+
+Сделано и собирается (`gradlew build`):
+
+- [x] `skidmyau.ai.MlpModel` — парсер `.skm` по §5.4, forward на `float[]`,
+      нормализация из `*.json`, fallback в null при любой ошибке;
+- [x] `skidmyau.ai.RotationPredictor` — следующая тик-дельта, latency,
+      overshoot, hurt-drag, σ-стохастичность, max-step, анти-залипание,
+      GCD-квантование с переносом остатка; bootstrap без модели;
+- [x] `skidmyau.ai.AiTarget` — контекст (entity/block/scaffold/idle);
+- [x] `skidmyau.ai.AimOffset` — CENTER/SOFT/LEARNED/RANDOM + OU-дрейф,
+      `toAngles(u, v, faceW)`;
+- [x] `skidmyau.ai.ClickProcess` — Gamma + OU CPS + паузы/промахи,
+      NORMAL/BUTTERFLY/DOUBLE/DRAG;
+- [x] модуль `AI` (`AiRotation`): свойства, ленивая загрузка моделей,
+      JSONL-рекордер (§4.2), `notifyClick`/`noteIdle`;
+- [x] `Scaffold`: `rotations=AI` + смещение точки на грани с raycast-валидацией
+      и fallback в центр; старые режимы 0..3 не тронуты;
+- [x] `KillAura`: `rotations=AI` + fallback на старый `RotationUtil`;
+- [x] `AutoClicker`: `click-mode` + гейтинг по `click-aim-gate`/реакции,
+      `LEGACY` = старое поведение;
+- [x] `tools/ai/`: `dataset.py`, `skm.py`, `train.py`, `validate.py`, README.
+
+Не сделано (нужны данные/железо):
+
+- [ ] человеческие сессии (главный блокер — синтетика бесполезна);
+- [ ] обученные `angles-v2.skm` / `aimpoint-v1.skm`;
+- [ ] прогон `validate.py`, тюнинг до AUC ≤ 0.60 / KS ≤ 0.05;
+- [ ] `ClickRecorder` и фит параметров `ClickProcess` по реальным кликам;
+- [ ] ПКМ-процесс для Scaffold (§9.5 п.6);
+- [ ] калибровка `humanize`/`latency`/`overshoot` по живой игре.

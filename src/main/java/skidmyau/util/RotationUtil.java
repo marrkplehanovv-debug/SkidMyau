@@ -33,6 +33,20 @@ public class RotationUtil {
         return (float) ((double) angle - (double) angle % (double) 0.0096f);
     }
 
+    /**
+     * Шаг поворота, который даёт один "тик" мыши при текущей чувствительности.
+     * В 1.8.9 MouseHelper: f = sens*0.6+0.2; step = f^3 * 8 * 0.15 градусов.
+     * Реальный игрок всегда кратен этому шагу — ИИ-ротация обязана тоже.
+     */
+    public static float getMouseStep() {
+        Minecraft mc = Minecraft.getMinecraft();
+        if (mc.gameSettings == null) {
+            return 0.0F;
+        }
+        float f = mc.gameSettings.mouseSensitivity * 0.6F + 0.2F;
+        return f * f * f * 8.0F * 0.15F;
+    }
+
     public static float[] getRotationsToBox(AxisAlignedBB boundingBox, float yaw, float pitch, float maxAngle, float smoothFactor) {
         Vec3 eyePos = RotationUtil.mc.thePlayer.getPositionEyes(1.0f);
         double minTargetY = boundingBox.minY + 0.05 * (boundingBox.maxY - boundingBox.minY);
